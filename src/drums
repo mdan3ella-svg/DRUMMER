@@ -1,0 +1,2204 @@
+export const TRACKS = [
+  { id: "kick", name: "Kick", short: "KICK", key: "1" },
+  { id: "snare", name: "Snare", short: "SNRE", key: "2" },
+  { id: "clap", name: "Clap", short: "CLAP", key: "3" },
+  { id: "hat", name: "Closed Hat", short: "HAT", key: "4" },
+  { id: "open", name: "Open Hat", short: "OPEN", key: "5" },
+  { id: "rim", name: "Rim", short: "RIM", key: "6" },
+  { id: "bell", name: "Cowbell", short: "BELL", key: "7" },
+  { id: "bass", name: "808 Bass", short: "808", key: "8" },
+  { id: "perc", name: "Perc", short: "PERC", key: "9" },
+  { id: "crash", name: "Crash", short: "CRSH", key: "0" },
+] as const;
+
+export type TrackId = (typeof TRACKS)[number]["id"];
+
+export const TRACK_IDS: TrackId[] = TRACKS.map((track) => track.id);
+
+export type StepCell = {
+  vel: number;
+  roll: 1 | 2 | 3;
+  note: number;
+  slide: boolean;
+};
+
+export type Grid = Record<TrackId, StepCell[]>;
+
+export type PaintMode = "hit" | "accent" | "ghost" | "erase";
+
+export type TrackMix = {
+  volume: number;
+  mute: boolean;
+  solo: boolean;
+  threshold: boolean;
+  lock: boolean;
+};
+
+export type Sound = {
+  drive: number;
+  kickDecay: number;
+  kickTune: number;
+  bassDecay: number;
+  glide: number;
+  hatLength: number;
+};
+
+export type Pattern = {
+  id: string;
+  name: string;
+  genre: string;
+  group: string;
+  bpm: number;
+  swing: number;
+  drive: number;
+  feel: string;
+  stepCount: 16 | 32;
+  tracks: Record<TrackId, StepCell[]>;
+};
+
+export type SavedBeat = {
+  id: string;
+  name: string;
+  savedAt: number;
+  bpm: number;
+  swing: number;
+  stepCount: 16 | 32;
+  grid: Grid;
+  octave: number;
+  pitchClass: number;
+  drive: number;
+  threshold: number;
+  thresholdMaster: boolean;
+  tracks: Record<TrackId, TrackMix>;
+  sound: Sound;
+};
+
+export type Schedule = {
+  grid: Grid;
+  stepCount: number;
+  bpm: number;
+  swing: number;
+  threshold: number;
+  thresholdMaster: boolean;
+  trackThreshold: Record<TrackId, boolean>;
+  trackMute: Record<TrackId, boolean>;
+  trackSolo: Record<TrackId, boolean>;
+  volumes: Record<TrackId, number>;
+  bassRoot: number;
+  sound: Sound;
+  master: number;
+};
+
+export const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"] as const;
+
+export const GROUPS = [
+  "Trap",
+  "Drill",
+  "South",
+  "Phonk",
+  "Plugg & Soul",
+  "Classic",
+  "Club & Global",
+  "Beat Patterns",
+] as const;
+
+export function emptyCell(): StepCell {
+  return { vel: 0, roll: 1, note: 0, slide: false };
+}
+
+export function midiToFreq(midi: number): number {
+  return 440 * 2 ** ((midi - 69) / 12);
+}
+
+export function noteName(midi: number): string {
+  const pc = ((Math.round(midi) % 12) + 12) % 12;
+  const oct = Math.floor(midi / 12) - 2;
+  return `${NOTE_NAMES[pc]}${oct}`;
+}
+
+export function bassRootOf(octave: number, pitchClass: number): number {
+  return 24 + octave * 12 + pitchClass;
+}
+
+export const VEL_HIT = 100;
+export const VEL_ACCENT = 124;
+export const VEL_GHOST = 42;
+
+import {
+  TRACK_IDS,
+  midiToFreq,
+  type Schedule,
+  type TrackId,
+} from "@/lib/drums/types";
+
+const noiseCache = new WeakMap<BaseAudioContext, AudioBuffer>();
+
+function noiseBuffer(ctx: BaseAudioContext): AudioBuffer {
+  const cached = noiseCache.get(ctx);
+  if (cached) return cached;
+  const length = Math.floor(ctx.sampleRate * 1.2);
+  const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let index = 0; index < length; index += 1) data[index] = Math.random() * 2 - 1;
+  noiseCache.set(ctx, buffer);
+  return buffer;
+}
+
+export function makeDriveCurve(amount: number): Float32Array<ArrayBuffer> {
+  const size = 512;
+  const curve = new Float32Array(size);
+  const k = 1 + amount * 32;
+  for (let index = 0; index < size; index += 1) {
+    const x = (index / (size - 1)) * 2 - 1;
+    const shaped = ((1 + k) * x) / (1 + k * Math.abs(x));
+    curve[index] = x * (1 - amount) + shaped * amount;
+  }
+  return curve;
+}
+
+export type Graph = {
+  ctx: BaseAudioContext;
+  master: GainNode;
+  drive: WaveShaperNode;
+  tracks: Record<TrackId, GainNode>;
+  room: GainNode;
+  openVoices: GainNode[];
+  analyser: AnalyserNode | null;
+};
+
+function envGain(ctx: BaseAudioContext, time: number, peak: number, attack: number, dur: number): GainNode {
+  const gain = ctx.createGain();
+  const end = time + Math.max(dur, attack + 0.02);
+  gain.gain.setValueAtTime(0.0001, time);
+  gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, peak), time + attack);
+  gain.gain.exponentialRampToValueAtTime(0.0001, end);
+  return gain;
+}
+
+function startOsc(
+  ctx: BaseAudioContext,
+  type: OscillatorType,
+  freq: number,
+  time: number,
+  dur: number,
+): OscillatorNode {
+  const osc = ctx.createOscillator();
+  osc.type = type;
+  osc.frequency.setValueAtTime(Math.max(20, freq), time);
+  osc.start(time);
+  osc.stop(time + dur + 0.05);
+  return osc;
+}
+
+function chokeOpens(graph: Graph, time: number) {
+  for (const voice of graph.openVoices) {
+    voice.gain.cancelScheduledValues(time);
+    voice.gain.setTargetAtTime(0.0001, time, 0.012);
+  }
+  graph.openVoices = [];
+}
+
+function triggerKick(graph: Graph, time: number, vel: number, tune: number, decay: number) {
+  const { ctx } = graph;
+  const v = vel / 127;
+  const dest = graph.tracks.kick;
+  const osc = ctx.createOscillator();
+  osc.type = "sine";
+  const fund = Math.max(34, tune);
+  osc.frequency.setValueAtTime(fund * 5.2, time);
+  osc.frequency.exponentialRampToValueAtTime(fund, time + 0.045);
+  const gain = envGain(ctx, time, 0.95 * v, 0.004, decay);
+  osc.connect(gain).connect(dest);
+  osc.start(time);
+  osc.stop(time + decay + 0.08);
+
+  const click = startOsc(ctx, "triangle", 1800, time, 0.03);
+  click.frequency.exponentialRampToValueAtTime(180, time + 0.02);
+  const clickGain = envGain(ctx, time, 0.28 * v, 0.001, 0.025);
+  click.connect(clickGain).connect(dest);
+
+  const src = ctx.createBufferSource();
+  src.buffer = noiseBuffer(ctx);
+  const hp = ctx.createBiquadFilter();
+  hp.type = "highpass";
+  hp.frequency.value = 1200;
+  const ng = envGain(ctx, time, 0.18 * v, 0.001, 0.02);
+  src.connect(hp).connect(ng).connect(dest);
+  src.start(time);
+  src.stop(time + 0.04);
+}
+
+function triggerBass(
+  graph: Graph,
+  time: number,
+  vel: number,
+  midi: number,
+  slideFrom: number | null,
+  glide: number,
+  decay: number,
+) {
+  const { ctx } = graph;
+  const v = vel / 127;
+  const dest = graph.tracks.bass;
+  const target = Math.max(28, midiToFreq(midi));
+  const osc = ctx.createOscillator();
+  osc.type = "sine";
+  const harm = ctx.createOscillator();
+  harm.type = "triangle";
+  const glideAt = time + Math.max(0.02, glide);
+  if (slideFrom !== null) {
+    const from = Math.max(28, midiToFreq(slideFrom));
+    osc.frequency.setValueAtTime(from, time);
+    harm.frequency.setValueAtTime(from * 2, time);
+    if (Math.abs(from - target) > 0.6) {
+      osc.frequency.exponentialRampToValueAtTime(target, glideAt);
+      harm.frequency.exponentialRampToValueAtTime(Math.max(30, target * 2), glideAt);
+    }
+  } else {
+    osc.frequency.setValueAtTime(target * 1.85, time);
+    osc.frequency.exponentialRampToValueAtTime(target, time + 0.035);
+    harm.frequency.setValueAtTime(target * 2, time);
+  }
+  const harmGain = ctx.createGain();
+  harmGain.gain.value = 0.16;
+  const click = ctx.createOscillator();
+  click.type = "sine";
+  click.frequency.setValueAtTime(target * 3.2, time);
+  const clickGain = envGain(ctx, time, 0.14 * v, 0.002, 0.05);
+  const gain = envGain(ctx, time, 0.82 * v, 0.008, decay);
+  const mix = ctx.createGain();
+  osc.connect(mix);
+  harm.connect(harmGain).connect(mix);
+  click.connect(clickGain).connect(dest);
+  mix.connect(gain).connect(dest);
+  const stop = time + decay + 0.06;
+  osc.start(time);
+  harm.start(time);
+  click.start(time);
+  osc.stop(stop);
+  harm.stop(stop);
+  click.stop(time + 0.08);
+}
+
+function triggerSnare(graph: Graph, time: number, vel: number) {
+  const { ctx } = graph;
+  const v = vel / 127;
+  const dest = graph.tracks.snare;
+  const body = startOsc(ctx, "triangle", 196, time, 0.16);
+  body.frequency.exponentialRampToValueAtTime(140, time + 0.08);
+  const bodyGain = envGain(ctx, time, 0.45 * v, 0.002, 0.12);
+  body.connect(bodyGain).connect(dest);
+
+  const src = ctx.createBufferSource();
+  src.buffer = noiseBuffer(ctx);
+  const bp = ctx.createBiquadFilter();
+  bp.type = "bandpass";
+  bp.frequency.value = 1800;
+  bp.Q.value = 0.7;
+  const hp = ctx.createBiquadFilter();
+  hp.type = "highpass";
+  hp.frequency.value = 900;
+  const ng = envGain(ctx, time, 0.7 * v, 0.002, 0.16);
+  src.connect(bp).connect(hp).connect(ng);
+  ng.connect(dest);
+  const send = ctx.createGain();
+  send.gain.value = 0.35;
+  ng.connect(send).connect(graph.room);
+  src.start(time);
+  src.stop(time + 0.22);
+}
+
+function triggerClap(graph: Graph, time: number, vel: number) {
+  const { ctx } = graph;
+  const v = vel / 127;
+  const dest = graph.tracks.clap;
+  const bursts = [0, 0.011, 0.022];
+  for (const offset of bursts) {
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuffer(ctx);
+    const bp = ctx.createBiquadFilter();
+    bp.type = "bandpass";
+    bp.frequency.value = 1400;
+    bp.Q.value = 0.8;
+    const g = envGain(ctx, time + offset, 0.55 * v, 0.001, 0.03);
+    src.connect(bp).connect(g).connect(dest);
+    src.start(time + offset);
+    src.stop(time + offset + 0.05);
+  }
+  const tail = ctx.createBufferSource();
+  tail.buffer = noiseBuffer(ctx);
+  const bp = ctx.createBiquadFilter();
+  bp.type = "bandpass";
+  bp.frequency.value = 1100;
+  const tg = envGain(ctx, time + 0.02, 0.4 * v, 0.004, 0.16);
+  tail.connect(bp).connect(tg);
+  tg.connect(dest);
+  const send = ctx.createGain();
+  send.gain.value = 0.28;
+  tg.connect(send).connect(graph.room);
+  tail.start(time);
+  tail.stop(time + 0.22);
+}
+
+function triggerHat(
+  graph: Graph,
+  time: number,
+  vel: number,
+  open: boolean,
+  hatLength: number,
+  slot: number,
+) {
+  const { ctx } = graph;
+  const v = vel / 127;
+  const dest = open ? graph.tracks.open : graph.tracks.hat;
+  if (!open) chokeOpens(graph, time);
+  const dur = (open ? 0.32 : 0.045) * hatLength * Math.max(0.35, slot);
+  const freqs = [205.3, 369.6, 470.3, 522.7, 800.2, 1260, 1680];
+  const band = ctx.createBiquadFilter();
+  band.type = "highpass";
+  band.frequency.value = open ? 6200 : 7600;
+  const gain = envGain(ctx, time, (open ? 0.28 : 0.22) * v, 0.001, dur);
+  if (open) {
+    graph.openVoices.push(gain);
+    if (graph.openVoices.length > 8) graph.openVoices.shift();
+  }
+  band.connect(gain).connect(dest);
+  for (const freq of freqs) {
+    const osc = startOsc(ctx, "square", freq, time, dur);
+    const level = ctx.createGain();
+    level.gain.value = 0.12;
+    osc.connect(level).connect(band);
+  }
+  const src = ctx.createBufferSource();
+  src.buffer = noiseBuffer(ctx);
+  const ng = envGain(ctx, time, 0.16 * v, 0.001, dur);
+  const hp = ctx.createBiquadFilter();
+  hp.type = "highpass";
+  hp.frequency.value = 8000;
+  src.connect(hp).connect(ng).connect(dest);
+  src.start(time);
+  src.stop(time + dur + 0.02);
+}
+
+function triggerRim(graph: Graph, time: number, vel: number) {
+  const { ctx } = graph;
+  const v = vel / 127;
+  const dest = graph.tracks.rim;
+  const osc = startOsc(ctx, "triangle", 455, time, 0.05);
+  const g = envGain(ctx, time, 0.4 * v, 0.001, 0.04);
+  osc.connect(g).connect(dest);
+  const ping = startOsc(ctx, "square", 1700, time, 0.02);
+  const pg = envGain(ctx, time, 0.12 * v, 0.001, 0.018);
+  ping.connect(pg).connect(dest);
+}
+
+function triggerBell(graph: Graph, time: number, vel: number) {
+  const { ctx } = graph;
+  const v = vel / 127;
+  const dest = graph.tracks.bell;
+  const filter = ctx.createBiquadFilter();
+  filter.type = "bandpass";
+  filter.frequency.value = 900;
+  filter.Q.value = 4;
+  const gain = envGain(ctx, time, 0.32 * v, 0.002, 0.18);
+  filter.connect(gain).connect(dest);
+  for (const freq of [540, 800]) {
+    const osc = startOsc(ctx, "square", freq, time, 0.2);
+    osc.connect(filter);
+  }
+}
+
+function triggerPerc(graph: Graph, time: number, vel: number) {
+  const { ctx } = graph;
+  const v = vel / 127;
+  const dest = graph.tracks.perc;
+  const osc = ctx.createOscillator();
+  osc.type = "sine";
+  osc.frequency.setValueAtTime(220, time);
+  osc.frequency.exponentialRampToValueAtTime(90, time + 0.08);
+  const gain = envGain(ctx, time, 0.45 * v, 0.003, 0.18);
+  osc.connect(gain).connect(dest);
+  osc.start(time);
+  osc.stop(time + 0.22);
+  const src = ctx.createBufferSource();
+  src.buffer = noiseBuffer(ctx);
+  const bp = ctx.createBiquadFilter();
+  bp.type = "bandpass";
+  bp.frequency.value = 2400;
+  const ng = envGain(ctx, time, 0.12 * v, 0.001, 0.04);
+  src.connect(bp).connect(ng).connect(dest);
+  src.start(time);
+  src.stop(time + 0.06);
+}
+
+function triggerCrash(graph: Graph, time: number, vel: number) {
+  const { ctx } = graph;
+  const v = vel / 127;
+  const dest = graph.tracks.crash;
+  const hp = ctx.createBiquadFilter();
+  hp.type = "highpass";
+  hp.frequency.value = 5000;
+  const gain = envGain(ctx, time, 0.34 * v, 0.004, 0.85);
+  hp.connect(gain);
+  gain.connect(dest);
+  const send = ctx.createGain();
+  send.gain.value = 0.4;
+  gain.connect(send).connect(graph.room);
+  const src = ctx.createBufferSource();
+  src.buffer = noiseBuffer(ctx);
+  src.connect(hp);
+  src.start(time);
+  src.stop(time + 0.95);
+  for (const freq of [430, 680, 920]) {
+    const osc = startOsc(ctx, "square", freq, time, 0.7);
+    const level = ctx.createGain();
+    level.gain.value = 0.04;
+    osc.connect(level).connect(hp);
+  }
+}
+
+function audible(state: Schedule, track: TrackId, vel: number): boolean {
+  if (vel <= 0) return false;
+  if (state.trackMute[track]) return false;
+  const soloed = TRACK_IDS.some((id) => state.trackSolo[id]);
+  if (soloed && !state.trackSolo[track]) return false;
+  if (state.thresholdMaster && state.trackThreshold[track] && vel < state.threshold) return false;
+  return true;
+}
+
+function previousBass(state: Schedule, step: number): number | null {
+  const lane = state.grid.bass;
+  const count = state.stepCount;
+  for (let back = 1; back < count; back += 1) {
+    const index = (step - back + count * 4) % count;
+    const cell = lane[index];
+    if (cell && audible(state, "bass", cell.vel)) return state.bassRoot + cell.note;
+  }
+  return null;
+}
+
+function untilNextBass(state: Schedule, step: number, stepDur: number): number {
+  const count = state.stepCount;
+  for (let ahead = 1; ahead <= count; ahead += 1) {
+    const cell = state.grid.bass[(step + ahead) % count];
+    if (cell && cell.vel > 0) return stepDur * ahead;
+  }
+  return stepDur * count;
+}
+
+export function scheduleStep(graph: Graph, time: number, step: number, state: Schedule, stepDur: number) {
+  const when = Math.max(time, graph.ctx.currentTime);
+  for (const track of TRACK_IDS) {
+    const cell = state.grid[track][step];
+    if (!cell || !audible(state, track, cell.vel)) continue;
+    if (track === "bass") {
+      const decay = Math.min(state.sound.bassDecay, Math.max(0.16, untilNextBass(state, step, stepDur) * 0.96));
+      const from = cell.slide ? previousBass(state, step) : null;
+      triggerBass(graph, when, cell.vel, state.bassRoot + cell.note, from, state.sound.glide, decay);
+      continue;
+    }
+    const rolls = track === "hat" || track === "open" ? cell.roll : 1;
+    for (let roll = 0; roll < rolls; roll += 1) {
+      const at = when + (roll * stepDur) / rolls;
+      const slot = 1 / rolls;
+      if (track === "kick") triggerKick(graph, at, cell.vel, state.sound.kickTune, state.sound.kickDecay);
+      else if (track === "snare") triggerSnare(graph, at, cell.vel);
+      else if (track === "clap") triggerClap(graph, at, cell.vel);
+      else if (track === "hat") triggerHat(graph, at, cell.vel, false, state.sound.hatLength, slot);
+      else if (track === "open") triggerHat(graph, at, cell.vel, true, state.sound.hatLength, Math.max(slot, 0.8));
+      else if (track === "rim") triggerRim(graph, at, cell.vel);
+      else if (track === "bell") triggerBell(graph, at, cell.vel);
+      else if (track === "perc") triggerPerc(graph, at, cell.vel);
+      else triggerCrash(graph, at, cell.vel);
+    }
+  }
+}
+
+export function buildGraph(ctx: BaseAudioContext, masterVol: number, driveAmount: number): Graph {
+  const master = ctx.createGain();
+  master.gain.value = masterVol;
+  const safety = ctx.createWaveShaper();
+  const clip = new Float32Array(256);
+  for (let index = 0; index < clip.length; index += 1) {
+    const x = (index / (clip.length - 1)) * 2 - 1;
+    clip[index] = Math.tanh(x * 1.35);
+  }
+  safety.curve = clip;
+  safety.oversample = "2x";
+
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -14;
+  comp.knee.value = 18;
+  comp.ratio.value = 3.2;
+  comp.attack.value = 0.004;
+  comp.release.value = 0.22;
+
+  const drive = ctx.createWaveShaper();
+  drive.curve = makeDriveCurve(driveAmount);
+  drive.oversample = "2x";
+  const subBus = ctx.createGain();
+  const drumBus = ctx.createGain();
+  subBus.connect(drive).connect(comp);
+  drumBus.connect(comp);
+  comp.connect(safety).connect(master);
+
+  let analyser: AnalyserNode | null = null;
+  if ("createAnalyser" in ctx) {
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 128;
+    analyser.smoothingTimeConstant = 0.72;
+    master.connect(analyser);
+    analyser.connect(ctx.destination);
+  } else {
+    master.connect(ctx.destination);
+  }
+
+  const delay = ctx.createDelay(0.5);
+  delay.delayTime.value = 0.18;
+  const feedback = ctx.createGain();
+  feedback.gain.value = 0.26;
+  const damp = ctx.createBiquadFilter();
+  damp.type = "lowpass";
+  damp.frequency.value = 2600;
+  const room = ctx.createGain();
+  const roomOut = ctx.createGain();
+  roomOut.gain.value = 0.2;
+  room.connect(delay).connect(damp);
+  damp.connect(feedback).connect(delay);
+  damp.connect(roomOut).connect(drumBus);
+
+  const tracks = {} as Record<TrackId, GainNode>;
+  for (const id of TRACK_IDS) {
+    const gain = ctx.createGain();
+    gain.gain.value = 0.8;
+    const panner = ctx.createStereoPanner();
+    const pan: Record<TrackId, number> = {
+      kick: 0,
+      snare: 0.06,
+      clap: -0.08,
+      hat: -0.18,
+      open: 0.22,
+      rim: 0.28,
+      bell: -0.24,
+      bass: 0,
+      perc: 0.32,
+      crash: -0.12,
+    };
+    panner.pan.value = pan[id];
+    gain.connect(panner);
+    panner.connect(id === "kick" || id === "bass" ? subBus : drumBus);
+    tracks[id] = gain;
+  }
+
+  return { ctx, master, drive, tracks, room, openVoices: [], analyser };
+}
+
+const DEFAULT_VOLUMES: Record<TrackId, number> = {
+  kick: 0.86,
+  snare: 0.72,
+  clap: 0.55,
+  hat: 0.42,
+  open: 0.36,
+  rim: 0.46,
+  bell: 0.4,
+  bass: 0.74,
+  perc: 0.48,
+  crash: 0.4,
+};
+
+class DrumEngine {
+  ctx: AudioContext | null = null;
+  graph: Graph | null = null;
+  analyser: AnalyserNode | null = null;
+  private timer = 0;
+  private nextTime = 0;
+  private stepIndex = 0;
+  private playing = false;
+  private read: () => Schedule = () => {
+    throw new Error("Engine has no state");
+  };
+  private onStep: (step: number) => void = () => {};
+  private pending: number[] = [];
+  private lastStep = 0;
+  private lastTime = 0;
+  private lastDur = 0.1;
+  private driveAmount = -1;
+
+  private build() {
+    const ctx = new AudioContext();
+    this.ctx = ctx;
+    this.graph = buildGraph(ctx, 0.85, 0.3);
+    this.analyser = this.graph.analyser;
+    for (const id of TRACK_IDS) this.graph.tracks[id].gain.value = DEFAULT_VOLUMES[id];
+  }
+
+  async ensure() {
+    if (!this.ctx || !this.graph) this.build();
+    if (this.ctx && this.ctx.state !== "running") await this.ctx.resume();
+    return this.ctx!;
+  }
+
+  private applyMix(state: Schedule) {
+    if (!this.graph || !this.ctx) return;
+    const now = this.ctx.currentTime;
+    this.graph.master.gain.setTargetAtTime(state.master, now, 0.02);
+    for (const id of TRACK_IDS) {
+      this.graph.tracks[id].gain.setTargetAtTime(state.volumes[id], now, 0.02);
+    }
+    if (state.sound.drive !== this.driveAmount) {
+      this.driveAmount = state.sound.drive;
+      this.graph.drive.curve = makeDriveCurve(state.sound.drive);
+    }
+  }
+
+  private tick = () => {
+    if (!this.playing || !this.ctx || !this.graph) return;
+    const state = this.read();
+    this.applyMix(state);
+    const stepDur = 60 / Math.max(40, state.bpm) / 4;
+    this.lastDur = stepDur;
+    while (this.nextTime < this.ctx.currentTime + 0.14) {
+      const count = Math.max(1, state.stepCount);
+      const step = this.stepIndex % count;
+      const swing = step % 2 === 1 ? state.swing * stepDur : 0;
+      const at = this.nextTime + swing;
+      scheduleStep(this.graph, at, step, state, stepDur);
+      this.lastStep = step;
+      this.lastTime = at;
+      const wait = Math.max(0, (at - this.ctx.currentTime) * 1000);
+      const token = window.setTimeout(() => this.onStep(step), wait);
+      this.pending.push(token);
+      this.nextTime += stepDur;
+      this.stepIndex = (step + 1) % count;
+    }
+  };
+
+  async start(read: () => Schedule, onStep: (step: number) => void) {
+    this.read = read;
+    this.onStep = onStep;
+    await this.ensure();
+    if (!this.ctx || !this.graph) return;
+    this.stop(false);
+    this.playing = true;
+    this.stepIndex = 0;
+    this.nextTime = this.ctx.currentTime + 0.05;
+    this.graph.openVoices = [];
+    this.applyMix(this.read());
+    this.timer = window.setInterval(this.tick, 25);
+    this.tick();
+  }
+
+  stop(clearHead = true) {
+    this.playing = false;
+    window.clearInterval(this.timer);
+    for (const token of this.pending) window.clearTimeout(token);
+    this.pending = [];
+    if (clearHead) this.onStep(-1);
+  }
+
+  quantize(stepCount: number): number {
+    if (!this.playing || !this.ctx) return 0;
+    const elapsed = this.ctx.currentTime - this.lastTime;
+    if (elapsed > this.lastDur * 0.5) return (this.lastStep + 1) % stepCount;
+    return this.lastStep;
+  }
+
+  async preview(track: TrackId, vel: number, midi: number | null, slideFrom: number | null) {
+    await this.ensure();
+    if (!this.graph || !this.ctx) return;
+    const state = this.read();
+    this.applyMix(state);
+    const time = this.ctx.currentTime;
+    if (track === "kick") triggerKick(this.graph, time, vel, state.sound.kickTune, state.sound.kickDecay);
+    else if (track === "snare") triggerSnare(this.graph, time, vel);
+    else if (track === "clap") triggerClap(this.graph, time, vel);
+    else if (track === "hat") triggerHat(this.graph, time, vel, false, state.sound.hatLength, 1);
+    else if (track === "open") triggerHat(this.graph, time, vel, true, state.sound.hatLength, 1);
+    else if (track === "rim") triggerRim(this.graph, time, vel);
+    else if (track === "bell") triggerBell(this.graph, time, vel);
+    else if (track === "perc") triggerPerc(this.graph, time, vel);
+    else if (track === "crash") triggerCrash(this.graph, time, vel);
+    else if (midi !== null) {
+      triggerBass(this.graph, time, vel, midi, slideFrom, state.sound.glide, Math.min(0.7, state.sound.bassDecay));
+    }
+  }
+}
+
+export const engine = new DrumEngine();
+
+import { buildGraph, scheduleStep } from "@/lib/drums/engine";
+import type { Schedule } from "@/lib/drums/types";
+
+function floatTo16(input: Float32Array): Int16Array {
+  const out = new Int16Array(input.length);
+  for (let index = 0; index < input.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, input[index] ?? 0));
+    out[index] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+  }
+  return out;
+}
+
+export async function renderLoop(state: Schedule, bars: number): Promise<AudioBuffer> {
+  const safeBpm = Math.max(40, state.bpm);
+  const secondsPerBar = (60 / safeBpm) * 4;
+  const duration = bars * secondsPerBar + 1.5;
+  const sampleRate = 44100;
+  const ctx = new OfflineAudioContext(2, Math.ceil(sampleRate * duration), sampleRate);
+  const graph = buildGraph(ctx, state.master, state.sound.drive);
+  for (const id of Object.keys(state.volumes) as (keyof Schedule["volumes"])[]) {
+    graph.tracks[id].gain.value = state.volumes[id];
+  }
+  const stepDur = 60 / safeBpm / 4;
+  const total = bars * state.stepCount;
+  for (let index = 0; index < total; index += 1) {
+    const step = index % state.stepCount;
+    const swing = step % 2 === 1 ? state.swing * stepDur : 0;
+    scheduleStep(graph, index * stepDur + swing, step, state, stepDur);
+  }
+  const audio = await ctx.startRendering();
+  let peak = 0;
+  const channel = audio.getChannelData(0);
+  for (let index = 0; index < channel.length; index += 32) {
+    peak = Math.max(peak, Math.abs(channel[index] ?? 0));
+  }
+  if (peak < 0.001) throw new Error("That loop rendered silent. Add a hit, then bounce again.");
+  return audio;
+}
+
+export async function audioBufferToMp3(buffer: AudioBuffer): Promise<Blob> {
+  const { Mp3Encoder } = await import("@breezystack/lamejs");
+  const encoder = new Mp3Encoder(2, buffer.sampleRate, 192);
+  const left = floatTo16(buffer.getChannelData(0));
+  const right = floatTo16(buffer.getChannelData(buffer.numberOfChannels > 1 ? 1 : 0));
+  const block = 1152;
+  const parts: Uint8Array[] = [];
+  for (let index = 0; index < left.length; index += block) {
+    const chunk = encoder.encodeBuffer(left.subarray(index, index + block), right.subarray(index, index + block));
+    if (chunk.length > 0) parts.push(chunk);
+  }
+  const end = encoder.flush();
+  if (end.length > 0) parts.push(end);
+  return new Blob(parts as BlobPart[], { type: "audio/mpeg" });
+}
+
+export function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+import {
+  TRACKS,
+  emptyCell,
+  type Grid,
+  type Pattern,
+  type StepCell,
+  type TrackId,
+} from "@/lib/drums/types";
+
+type Raw = {
+  id: string;
+  name: string;
+  genre: string;
+  group: string;
+  bpm: number;
+  swing?: number;
+  drive?: number;
+  feel: string;
+  kick: string;
+  snare?: string;
+  clap?: string;
+  hat?: string;
+  open?: string;
+  rim?: string;
+  bell?: string;
+  perc?: string;
+  crash?: string;
+  bass?: string;
+  slide?: string;
+};
+
+const DRUM_CHARS: Record<string, { vel: number; roll: 1 | 2 | 3 }> = {
+  ".": { vel: 0, roll: 1 },
+  g: { vel: 42, roll: 1 },
+  x: { vel: 100, roll: 1 },
+  X: { vel: 124, roll: 1 },
+  r: { vel: 100, roll: 2 },
+  R: { vel: 124, roll: 2 },
+  t: { vel: 108, roll: 3 },
+  T: { vel: 124, roll: 3 },
+};
+
+const BASS_SEMI: Record<string, number> = {
+  "0": 0,
+  "1": 1,
+  "2": 2,
+  "3": 3,
+  "4": 4,
+  "5": 5,
+  "6": 6,
+  "7": 7,
+  "8": 8,
+  "9": 9,
+  a: 10,
+  b: 11,
+  c: 12,
+  d: 13,
+  e: 14,
+  f: 15,
+  h: -1,
+  y: -2,
+  w: -5,
+  u: -7,
+};
+
+function clean(value: string): string {
+  return value.replace(/\s+/g, "");
+}
+
+function parseDrums(source: string, len: number, id: string, lane: string): StepCell[] {
+  const text = clean(source);
+  if (text.length !== len) {
+    throw new Error(`${id} ${lane} is ${text.length}, expected ${len}`);
+  }
+  return [...text].map((char) => {
+    const hit = DRUM_CHARS[char];
+    if (!hit) throw new Error(`${id} ${lane} bad '${char}'`);
+    return { vel: hit.vel, roll: hit.roll, note: 0, slide: false };
+  });
+}
+
+function parseBass(source: string, slideSource: string, len: number, id: string): StepCell[] {
+  const notes = clean(source);
+  const slides = clean(slideSource);
+  if (notes.length !== len) throw new Error(`${id} bass is ${notes.length}, expected ${len}`);
+  if (slides.length !== len) throw new Error(`${id} slide is ${slides.length}, expected ${len}`);
+  return [...notes].map((char, index) => {
+    if (char === ".") return emptyCell();
+    const semi = BASS_SEMI[char];
+    if (semi === undefined) throw new Error(`${id} bass bad '${char}'`);
+    const slideChar = slides[index];
+    if (slideChar !== "." && slideChar !== "s") {
+      throw new Error(`${id} slide bad '${slideChar}'`);
+    }
+    return { vel: 112, roll: 1 as const, note: semi, slide: slideChar === "s" };
+  });
+}
+
+function make(raw: Raw): Pattern {
+  const len = clean(raw.kick).length;
+  if (len !== 16 && len !== 32) throw new Error(`${raw.id} kick length ${len}`);
+  const blank = ".".repeat(len);
+  const tracks = {
+    kick: parseDrums(raw.kick, len, raw.id, "kick"),
+    snare: parseDrums(raw.snare ?? blank, len, raw.id, "snare"),
+    clap: parseDrums(raw.clap ?? blank, len, raw.id, "clap"),
+    hat: parseDrums(raw.hat ?? blank, len, raw.id, "hat"),
+    open: parseDrums(raw.open ?? blank, len, raw.id, "open"),
+    rim: parseDrums(raw.rim ?? blank, len, raw.id, "rim"),
+    bell: parseDrums(raw.bell ?? blank, len, raw.id, "bell"),
+    perc: parseDrums(raw.perc ?? blank, len, raw.id, "perc"),
+    crash: parseDrums(raw.crash ?? blank, len, raw.id, "crash"),
+    bass: parseBass(raw.bass ?? blank, raw.slide ?? blank, len, raw.id),
+  };
+  return {
+    id: raw.id,
+    name: raw.name,
+    genre: raw.genre,
+    group: raw.group,
+    bpm: raw.bpm,
+    swing: raw.swing ?? 0,
+    drive: raw.drive ?? 0.3,
+    feel: raw.feel,
+    stepCount: len as 16 | 32,
+    tracks,
+  };
+}
+
+const RAW: Raw[] = [
+  {
+    id: "night-shift",
+    name: "Night Shift",
+    genre: "Atlanta Trap",
+    group: "Trap",
+    bpm: 140,
+    drive: 0.3,
+    feel: "Sparse kicks, clap on 2 and 4, ghost hats under the threshold.",
+    kick: "x..x ...x ..x. ....",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... x...",
+    hat: "Xg.x Xg.x Xg.x Xgxx",
+    open: ".... ..x. .... ..x.",
+    crash: "x... .... .... ....",
+    bass: "0..0 ...3 ..0. ....",
+  },
+  {
+    id: "rearview",
+    name: "Rearview",
+    genre: "Atlanta Trap",
+    group: "Trap",
+    bpm: 144,
+    drive: 0.34,
+    feel: "Late clap and a fifth in the 808.",
+    kick: "x... ..x. ..x. x...",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... .x..",
+    hat: "xgxg xgxg xgxg xxxx",
+    open: "..x. .... ..x. ....",
+    bass: "0... ..7. ..0. 0...",
+    slide: ".... ..s. .... ....",
+  },
+  {
+    id: "ominous",
+    name: "Ominous",
+    genre: "Dark Trap",
+    group: "Trap",
+    bpm: 132,
+    drive: 0.42,
+    feel: "Half-time snare, long 808, plenty of air.",
+    kick: "x... .... ..x. ....",
+    snare: ".... .... x... ....",
+    clap: ".... .... x... ....",
+    hat: "x... x... x... x.x.",
+    open: ".... .... .... ..x.",
+    rim: "..x. .... ..x. ....",
+    bass: "0... .... ..3. ....",
+    slide: ".... .... ..s. ....",
+  },
+  {
+    id: "vampire",
+    name: "Vampire",
+    genre: "Rage",
+    group: "Trap",
+    bpm: 152,
+    drive: 0.74,
+    feel: "Four-on-the-kick and hat rolls that sprint the bar.",
+    kick: "x... x... x... x...",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... x.x.",
+    hat: "xxxx xxxx rrrr tttt",
+    open: ".... ..x. .... ..x.",
+    bass: "0... 0... a... 0...",
+  },
+  {
+    id: "heartbreak",
+    name: "Heartbreak",
+    genre: "Emo Trap",
+    group: "Trap",
+    bpm: 136,
+    drive: 0.24,
+    feel: "Rolling hats and a sliding minor 808.",
+    kick: "x... ..x. .... x...",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... x...",
+    hat: "xxrx xxrx xxrx xxrx",
+    open: ".... .... .... ..x.",
+    rim: "..x. .... ..x. ....",
+    bass: "0... ..3. .... 5...",
+    slide: ".... ..s. .... s...",
+  },
+  {
+    id: "waves",
+    name: "Waves",
+    genre: "Melodic Trap",
+    group: "Trap",
+    bpm: 138,
+    drive: 0.26,
+    feel: "Two-bar minor walk with glides between chord tones.",
+    kick: "x..x .... ..x. .... x... ..x. .... ..x.",
+    snare: ".... x... .... x... .... x... .... x...",
+    clap: ".... x... .... x... .... .x.. .... x...",
+    hat: "xgxg xgxg xgxg xgxx xgxg xgxg xxgx xgxg",
+    open: ".... .... ..x. .... .... ..x. .... ..x.",
+    bass: "0..3 ..5. ..7. 5.3. 0..3 ..a. ..7. 5...",
+    slide: "..s. ..s. ..s. s.s. ..s. ..s. ..s. ....",
+  },
+  {
+    id: "coliseum",
+    name: "Coliseum",
+    genre: "Orchestral Trap",
+    group: "Trap",
+    bpm: 140,
+    drive: 0.4,
+    feel: "Downbeat crashes and a wide half-bar kick.",
+    kick: "x... .... x..x ....",
+    snare: ".... x... .... x...",
+    clap: ".... X... .... X...",
+    hat: "x.x. x.x. x.x. x.xx",
+    crash: "x... .... x... ....",
+    perc: ".... .... x... ....",
+    bass: "0... .... 0..0 ....",
+  },
+  {
+    id: "pocket",
+    name: "Pocket",
+    genre: "Minimal Trap",
+    group: "Trap",
+    bpm: 134,
+    drive: 0.2,
+    feel: "One kick, one 808, hats on the offbeat.",
+    kick: "x... .... ..x. ....",
+    snare: ".... x... .... x...",
+    hat: "..x. ..x. ..x. ..x.",
+    open: ".... .... .... ..x.",
+    bass: "0... .... .... ....",
+  },
+  {
+    id: "sprint",
+    name: "Sprint",
+    genre: "Double-Time Trap",
+    group: "Trap",
+    bpm: 148,
+    drive: 0.46,
+    feel: "Constant 32nd-note hats over a pushing kick.",
+    kick: "x... ..x. ..x. .x..",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... x...",
+    hat: "rrrr rrrr rrrr rrrr",
+    open: ".... ..x. .... ..x.",
+    bass: "0... ..7. ..0. .3..",
+  },
+  {
+    id: "festival",
+    name: "Festival",
+    genre: "Club Trap",
+    group: "Trap",
+    bpm: 150,
+    drive: 0.52,
+    feel: "Drop kicks on the quarter and a crash on 1.",
+    kick: "x... x... x... x...",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... x...",
+    hat: "xxxx xxxx xxxx xxxt",
+    crash: "x... .... .... ....",
+    bass: "0... 0... 0... 7...",
+  },
+  {
+    id: "estate",
+    name: "Estate",
+    genre: "UK Drill",
+    group: "Drill",
+    bpm: 142,
+    drive: 0.5,
+    feel: "Syncopated kicks, snare on 3, sliding 808s.",
+    kick: "x..x .... .x.x ....",
+    snare: ".... .... x... ....",
+    clap: ".... .... x..x ....",
+    hat: "x.x. x.x. x.x. x.x.",
+    open: ".... .... .... ..x.",
+    bass: "0..3 .... .0.7 ....",
+    slide: "..s. .... .s.s ....",
+  },
+  {
+    id: "borough",
+    name: "Borough",
+    genre: "NY Drill",
+    group: "Drill",
+    bpm: 145,
+    drive: 0.44,
+    feel: "Bouncy kicks with a slide into the minor third.",
+    kick: "x..x ..x. ..x. .x..",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... x...",
+    hat: "x.x. x.xx x.x. x.xx",
+    bass: "0..0 ..3. ..0. .7..",
+    slide: ".... ..s. .... ....",
+  },
+  {
+    id: "corner",
+    name: "Corner",
+    genre: "Chicago Drill",
+    group: "Drill",
+    bpm: 138,
+    drive: 0.56,
+    feel: "Hard and simple, with a bell on the quarters.",
+    kick: "x... ..x. x... ....",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... x...",
+    hat: "x.x. x.x. x.x. x.x.",
+    bell: "x... x... x... x...",
+    bass: "0... ..0. 3... ....",
+  },
+  {
+    id: "slide-two",
+    name: "Slide Two",
+    genre: "UK Drill",
+    group: "Drill",
+    bpm: 140,
+    drive: 0.5,
+    feel: "Two bars: the 808 answers itself in the second half.",
+    kick: "x..x .... .x.x .... x... ..x. .... x..x",
+    snare: ".... .... x... .... .... .... x... .x..",
+    clap: ".... .... x... .... .... .... x..x ....",
+    hat: "x.x. x.x. x.xx x.x. x.x. x.x. x.x. xxrr",
+    bass: "0..3 .... .u.0 7... 0... ..3. .... 7..5",
+    slide: "..s. .... .s.. s... .... ..s. .... s..s",
+  },
+  {
+    id: "triple-six",
+    name: "Triple Six",
+    genre: "Memphis",
+    group: "South",
+    bpm: 147,
+    drive: 0.62,
+    feel: "Straight hats, cowbell, and a dark minor 808.",
+    kick: "x... ..x. ..x. ....",
+    snare: ".... x... .... x...",
+    hat: "xxxx xxxx xxxx xxxx",
+    bell: "x..x ..x. ..x. .x..",
+    open: ".... ..x. .... ....",
+    bass: "0... ..0. ..3. ....",
+  },
+  {
+    id: "slab",
+    name: "Slab",
+    genre: "Houston",
+    group: "South",
+    bpm: 74,
+    swing: 0.08,
+    drive: 0.16,
+    feel: "Screwed tempo. Leave space and let the kick ring.",
+    kick: "x... .... x... ....",
+    snare: ".... x... .... x...",
+    hat: "x... x... x... x...",
+    open: ".... .... x... ....",
+    bass: "0... .... .... ....",
+  },
+  {
+    id: "stomp",
+    name: "Stomp",
+    genre: "Crunk",
+    group: "South",
+    bpm: 148,
+    drive: 0.5,
+    feel: "Chant-ready claps and a kick on every quarter.",
+    kick: "x... x... x... x...",
+    snare: ".... x... .... x...",
+    clap: ".... x.x. .... x.x.",
+    hat: "x.x. x.x. x.x. x.x.",
+    crash: "x... .... x... ....",
+    bass: "0... 0... 0... 0...",
+  },
+  {
+    id: "triggerman",
+    name: "Triggerman",
+    genre: "Bounce",
+    group: "South",
+    bpm: 102,
+    drive: 0.3,
+    feel: "The bounce kick: 1, 2, the and of 2, and 3.",
+    kick: "x... x.x. x... x...",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... x...",
+    hat: "x.x. x.x. x.x. x.x.",
+    open: ".... ..x. .... ....",
+    bass: "0... 0.0. 0... 0...",
+  },
+  {
+    id: "parking-lot",
+    name: "Parking Lot",
+    genre: "Southern Trap",
+    group: "South",
+    bpm: 140,
+    drive: 0.36,
+    feel: "Bouncy southern kick with open hats on the ands.",
+    kick: "x..x .... x..x ..x.",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... x...",
+    hat: "xgxg xgxg xxxx xgxg",
+    open: ".... ..x. .... ..x.",
+    bass: "0..0 .... 0..3 ..0.",
+  },
+  {
+    id: "drift",
+    name: "Drift",
+    genre: "Phonk",
+    group: "Phonk",
+    bpm: 162,
+    drive: 0.86,
+    feel: "Cowbell lead, distorted kick, Memphis bones.",
+    kick: "x... .... x... ....",
+    snare: ".... x... .... x...",
+    hat: "x.x. x.x. x.x. x.x.",
+    bell: "x.x. x.xx .x.x x.x.",
+    perc: "..x. ..x. ..x. ..x.",
+    bass: "0... .... 7... ....",
+  },
+  {
+    id: "cowbell-night",
+    name: "Cowbell Night",
+    genre: "Phonk",
+    group: "Phonk",
+    bpm: 150,
+    drive: 0.78,
+    feel: "The bell is the hook. Push drive if you want it meaner.",
+    kick: "x... ..x. .... x...",
+    snare: ".... x... .... x...",
+    hat: "xxxx xxxx xxxx xxxx",
+    bell: "x.xx x.x. x.xx x.x.",
+    bass: "0... ..0. .... 7...",
+  },
+  {
+    id: "slowed-drift",
+    name: "Slowed Drift",
+    genre: "Phonk",
+    group: "Phonk",
+    bpm: 108,
+    drive: 0.7,
+    feel: "Half-time phonk. Snare waits until beat 3.",
+    kick: "x... .... ..x. ....",
+    snare: ".... .... x... ....",
+    hat: "x... x... x... x.x.",
+    bell: "x.x. ..x. x.x. ..x.",
+    bass: "0... .... ..7. ....",
+  },
+  {
+    id: "gemstone",
+    name: "Gemstone",
+    genre: "Plugg",
+    group: "Plugg & Soul",
+    bpm: 130,
+    drive: 0.18,
+    feel: "Soft hats, a pocket kick, and a ghosted clap.",
+    kick: "x..x .... .x.. x...",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... x..g",
+    hat: "x..g x..g x..g x..g",
+    open: ".... .... ..x. ....",
+    bass: "0..0 .... .3.. 0...",
+  },
+  {
+    id: "rose-gold",
+    name: "Rose Gold",
+    genre: "Pluggnb",
+    group: "Plugg & Soul",
+    bpm: 124,
+    drive: 0.16,
+    feel: "Melodic 808, rim clicks, and room to sing.",
+    kick: "x... ..x. .... .x..",
+    snare: ".... x... .... x...",
+    hat: "x... x... x... x...",
+    open: ".... ..x. .... ....",
+    rim: "..x. .... ..x. ....",
+    bass: "0... ..3. .... 5.3.",
+    slide: ".... ..s. .... s...",
+  },
+  {
+    id: "midnight",
+    name: "Midnight",
+    genre: "Trap Soul",
+    group: "Plugg & Soul",
+    bpm: 120,
+    drive: 0.14,
+    feel: "Half-time pocket with a rim on the offbeats.",
+    kick: "x... .... ..x. ....",
+    snare: ".... .... x... ....",
+    clap: ".... .... x... ....",
+    hat: "x.x. x.x. x.x. x.x.",
+    rim: "..x. ..x. .... x...",
+    bass: "0... .... ..3. ....",
+  },
+  {
+    id: "ether",
+    name: "Ether",
+    genre: "Cloud Rap",
+    group: "Plugg & Soul",
+    bpm: 114,
+    drive: 0.1,
+    feel: "Slow, thin hats, a fifth in the sub.",
+    kick: "x... .... x... ....",
+    snare: ".... .... x... ....",
+    hat: "x... x... x... x...",
+    open: ".... .... .... ..x.",
+    perc: "..x. .... ..x. ....",
+    bass: "0... .... 7... ....",
+  },
+  {
+    id: "pain",
+    name: "Pain",
+    genre: "Sad Trap",
+    group: "Plugg & Soul",
+    bpm: 130,
+    drive: 0.22,
+    feel: "Drops a minor second under the bar. Slide is the bruise.",
+    kick: "x... .... x... ....",
+    snare: ".... .... x... ....",
+    clap: ".... .... x... ....",
+    hat: "x..x ..x. x..x ..x.",
+    rim: "..x. .... .... ....",
+    bass: "0... .... 3... h...",
+    slide: ".... .... .... s...",
+  },
+  {
+    id: "crate",
+    name: "Crate",
+    genre: "Boom Bap",
+    group: "Classic",
+    bpm: 92,
+    swing: 0.58,
+    drive: 0.12,
+    feel: "Swung hats, no 808. The kick is the low end.",
+    kick: "x..x ...x ..x. ....",
+    snare: ".... x... .... x...",
+    hat: "xgxg xgxg xgxg xgxg",
+    open: ".... ..x. .... ..x.",
+    perc: "x... .... .... x...",
+  },
+  {
+    id: "ninety-four",
+    name: "Ninety-Four",
+    genre: "Boom Bap",
+    group: "Classic",
+    bpm: 96,
+    swing: 0.5,
+    drive: 0.12,
+    feel: "A ghost snare at the end of the bar and dusty hats.",
+    kick: "x... ..x. x..x ....",
+    snare: ".... x... .... x..g",
+    hat: "x.x. xgx. x.x. xgxg",
+    open: ".... .... .... ..x.",
+    rim: ".... .... ..x. ....",
+  },
+  {
+    id: "dusty",
+    name: "Dusty",
+    genre: "Lo-fi",
+    group: "Classic",
+    bpm: 84,
+    swing: 0.62,
+    drive: 0.06,
+    feel: "Slow swing. Leave the drive almost off.",
+    kick: "x... ..x. .x.. ..x.",
+    snare: ".... x... .... x...",
+    hat: "xgxg xgxg xgxg xg.g",
+    rim: ".... ..x. .... ..x.",
+  },
+  {
+    id: "g-funk",
+    name: "G-Funk",
+    genre: "West Coast",
+    group: "Classic",
+    bpm: 98,
+    swing: 0.18,
+    drive: 0.22,
+    feel: "Bounce on 1 and the and of 3, cowbell answering.",
+    kick: "x... .... x.x. ....",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... x...",
+    hat: "x.x. x.x. x.x. x.x.",
+    bell: "..x. ..x. ..x. ..x.",
+    open: ".... ..x. .... ....",
+    bass: "0... .... 0.3. ....",
+  },
+  {
+    id: "break-chop",
+    name: "Break Chop",
+    genre: "Breaks",
+    group: "Classic",
+    bpm: 136,
+    swing: 0.12,
+    drive: 0.2,
+    feel: "Two bars chopped off a break. Kick and snare trade.",
+    kick: "x..x ..x. ..x. x... ..x. ..x. x..x ....",
+    snare: ".... x..x x..x ..x. .... x..x .x.. x..x",
+    hat: "x.x. x.x. x.x. x.x. x.x. x.x. x.x. x.x.",
+    open: ".... .... ..x. .... .... .... ..x. ....",
+  },
+  {
+    id: "dembow",
+    name: "Dembow",
+    genre: "Latin Trap",
+    group: "Club & Global",
+    bpm: 96,
+    drive: 0.34,
+    feel: "Kick on the quarters, snare on the dembow ands.",
+    kick: "x... x... x... x.x.",
+    snare: "..x. x... ..x. x...",
+    clap: "..x. x... ..x. x...",
+    hat: "x.x. x.x. x.x. x.x.",
+    bell: "x... x... x... x...",
+    bass: "0... 0... 0... 0.7.",
+  },
+  {
+    id: "perreo",
+    name: "Perreo",
+    genre: "Reggaeton",
+    group: "Club & Global",
+    bpm: 94,
+    drive: 0.36,
+    feel: "Dembow with trap hats and a fifth in the 808.",
+    kick: "x... x... x... .x..",
+    snare: "..x. x... .x.. x...",
+    hat: "xxxx xxxx xxxx xxxx",
+    open: ".... ..x. .... ..x.",
+    bass: "0... 0... 7... .0..",
+  },
+  {
+    id: "logos",
+    name: "Logos",
+    genre: "Afro Trap",
+    group: "Club & Global",
+    bpm: 108,
+    swing: 0.08,
+    drive: 0.28,
+    feel: "Percussion grid under a trap snare and sub.",
+    kick: "x..x ..x. ..x. .x..",
+    snare: ".... x... .... x...",
+    hat: "x.x. x.xx .x.x x.x.",
+    perc: "..x. x... x.x. .x..",
+    rim: "x... ..x. x... ..x.",
+    bell: ".... x... .... x...",
+    bass: "0..0 ..7. ..0. .0..",
+  },
+  {
+    id: "bedrock",
+    name: "Bedrock",
+    genre: "Jersey Club",
+    group: "Club & Global",
+    bpm: 134,
+    drive: 0.4,
+    feel: "Busy kick, open-hat stutter, club tempo.",
+    kick: "x..x x... x..x x..x",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... x...",
+    hat: "xxxx xxxx xxxx xxxx",
+    open: ".... ..x. ..x. ....",
+    perc: "..x. .... ..x. ....",
+    bass: "0..0 0... 0..0 0..0",
+  },
+  {
+    id: "assembly",
+    name: "Assembly",
+    genre: "Detroit",
+    group: "Club & Global",
+    bpm: 138,
+    drive: 0.44,
+    feel: "Off-grid kicks and a clap that doubles late.",
+    kick: "x.x. .x.x .x.. x...",
+    snare: ".... x... .... x...",
+    clap: ".... x..x .... x...",
+    hat: "x.x. x.x. x.x. x.x.",
+    rim: "x... .... .... x...",
+    bass: "0.0. .3.0 .0.. 7...",
+  },
+  {
+    id: "backbeat",
+    name: "Backbeat",
+    genre: "Pattern",
+    group: "Beat Patterns",
+    bpm: 110,
+    swing: 0.2,
+    drive: 0.18,
+    feel: "The plain backbeat everything else decorates.",
+    kick: "x... .... x... ....",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... x...",
+    hat: "x.x. x.x. x.x. x.x.",
+  },
+  {
+    id: "half-time",
+    name: "Half Time",
+    genre: "Pattern",
+    group: "Beat Patterns",
+    bpm: 150,
+    drive: 0.34,
+    feel: "Snare on 3 so 150 feels like 75.",
+    kick: "x... .... .... ....",
+    snare: ".... .... x... ....",
+    clap: ".... .... x... ....",
+    hat: "x.x. x.x. x.x. x.x.",
+    open: ".... .... .... ..x.",
+    bass: "0... .... .... ....",
+  },
+  {
+    id: "four-floor",
+    name: "Four Floor",
+    genre: "Pattern",
+    group: "Beat Patterns",
+    bpm: 126,
+    drive: 0.28,
+    feel: "Kick on every quarter. Club grid, trap hats.",
+    kick: "x... x... x... x...",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... x...",
+    hat: "xxxx xxxx xxxx xxxx",
+    open: ".... ..x. .... ..x.",
+  },
+  {
+    id: "tresillo",
+    name: "Tresillo",
+    genre: "Pattern",
+    group: "Beat Patterns",
+    bpm: 116,
+    drive: 0.3,
+    feel: "3+3+2 twice across the bar. The Latin spine.",
+    kick: "x..x ..x. x..x ..x.",
+    snare: ".... x... .... x...",
+    hat: "x.x. x.x. x.x. x.x.",
+    bass: "0..0 ..0. 0..0 ..7.",
+  },
+  {
+    id: "gallop",
+    name: "Gallop",
+    genre: "Pattern",
+    group: "Beat Patterns",
+    bpm: 144,
+    drive: 0.4,
+    feel: "Kick gallops on 1 and 3.",
+    kick: "x.xx .... x.xx ....",
+    snare: ".... x... .... x...",
+    hat: "xxxx xxxx xxxx xxxx",
+    bass: "0.00 .... 0.00 ....",
+  },
+  {
+    id: "son-clave",
+    name: "Son Clave",
+    genre: "Pattern",
+    group: "Beat Patterns",
+    bpm: 104,
+    drive: 0.24,
+    feel: "3-2 son clave on the rim, two bars, trap backbeat under it.",
+    kick: "x... .... x... .... x... .... x... ..x.",
+    snare: ".... x... .... x... .... x... .... x...",
+    hat: "x.x. x.x. x.x. x.x. x.x. x.x. x.x. x.x.",
+    rim: "x... ..x. .... x... .... x... x... ....",
+    bell: "x... ..x. .... x... .... x... x... ....",
+    bass: "0... .... 0... .... 0... .... 7... ....",
+  },
+  {
+    id: "charleston",
+    name: "Charleston",
+    genre: "Pattern",
+    group: "Beat Patterns",
+    bpm: 112,
+    swing: 0.35,
+    drive: 0.16,
+    feel: "Dotted kick on 1 and 3, swung hats.",
+    kick: "x..x .... x..x ....",
+    snare: ".... x... .... x...",
+    hat: "x.x. x.x. x.x. x.x.",
+  },
+  {
+    id: "hat-rolls",
+    name: "Hat Rolls",
+    genre: "Pattern",
+    group: "Beat Patterns",
+    bpm: 140,
+    drive: 0.32,
+    feel: "A lesson in rolls: doubles, then a triplet burst.",
+    kick: "x... .... ..x. ....",
+    snare: ".... x... .... x...",
+    clap: ".... x... .... x...",
+    hat: "x.x. rrxx xxxx tttt",
+    open: ".... .... .... ..x.",
+    bass: "0... .... ..0. ....",
+  },
+  {
+    id: "accent-grid",
+    name: "Accent Grid",
+    genre: "Pattern",
+    group: "Beat Patterns",
+    bpm: 100,
+    drive: 0.22,
+    feel: "Turn the threshold up. Ghosts drop, then only accents remain.",
+    kick: "X... .... x... ....",
+    snare: ".... X... .... x...",
+    clap: ".... X... .... g...",
+    hat: "XgXg XgXg XgXg XgXg",
+    bass: "0... .... .... ....",
+  },
+];
+
+export const PATTERNS: Pattern[] = RAW.map(make);
+
+export const DEFAULT_PATTERN_ID = "night-shift";
+
+export function patternById(id: string): Pattern | undefined {
+  return PATTERNS.find((pattern) => pattern.id === id);
+}
+
+export function gridFromPattern(pattern: Pattern): Grid {
+  const grid = {} as Grid;
+  for (const track of TRACKS) {
+    const source = pattern.tracks[track.id];
+    grid[track.id] = Array.from({ length: 32 }, (_, index) => {
+      const cell = source[index];
+      return cell ? { ...cell } : emptyCell();
+    });
+  }
+  return grid;
+}
+
+const SCALE = [0, 3, 5, 7, 10, 12, -7];
+
+export function varyGrid(grid: Grid, stepCount: number, locks: Record<TrackId, boolean>): Grid {
+  const next = structuredClone(grid);
+  for (const track of TRACKS) {
+    if (locks[track.id]) continue;
+    const cells = next[track.id];
+    const before = cells.map((cell) => cell.vel);
+    for (let index = 0; index < stepCount; index += 1) {
+      const cell = cells[index];
+      if (track.id === "hat" || track.id === "open") {
+        if (Math.random() < 0.18) {
+          if (cell.vel === 0) cell.vel = Math.random() < 0.55 ? 42 : 100;
+          else if (Math.random() < 0.4) cell.vel = 0;
+          else cell.vel = cell.vel >= 110 ? 42 : 100;
+        }
+        if (track.id === "hat" && index > stepCount - 5 && Math.random() < 0.4) {
+          cell.roll = Math.random() < 0.5 ? 2 : 3;
+          if (cell.vel === 0) cell.vel = 100;
+        }
+      } else if (track.id === "kick") {
+        if (index > 0 && before[index] > 0 && Math.random() < 0.22) {
+          const dir = Math.random() < 0.5 ? -1 : 1;
+          const target = index + dir;
+          if (target > 0 && target < stepCount && cells[target].vel === 0) {
+            cells[target] = { ...cell, vel: before[index] };
+            cell.vel = 0;
+          }
+        }
+      } else if (track.id === "bass" && cell.vel > 0 && Math.random() < 0.22) {
+        cell.note = SCALE[Math.floor(Math.random() * SCALE.length)] ?? 0;
+        if (Math.random() < 0.35) cell.slide = !cell.slide;
+      } else if (cell.vel > 0 && Math.random() < 0.08) {
+        cell.vel = 0;
+      } else if (cell.vel === 0 && Math.random() < 0.04 && track.id !== "crash") {
+        cell.vel = 100;
+      }
+    }
+  }
+  return next;
+}
+
+import { create } from "zustand";
+import { gridFromPattern, patternById, varyGrid, DEFAULT_PATTERN_ID } from "@/lib/drums/patterns";
+import {
+  TRACKS,
+  VEL_ACCENT,
+  VEL_GHOST,
+  VEL_HIT,
+  bassRootOf,
+  emptyCell,
+  type Grid,
+  type PaintMode,
+  type SavedBeat,
+  type Schedule,
+  type Sound,
+  type StepCell,
+  type TrackId,
+  type TrackMix,
+} from "@/lib/drums/types";
+
+const STORAGE_KEY = "drummer-v1";
+
+const DEFAULT_VOLUMES: Record<TrackId, number> = {
+  kick: 0.86,
+  snare: 0.72,
+  clap: 0.55,
+  hat: 0.42,
+  open: 0.36,
+  rim: 0.46,
+  bell: 0.4,
+  bass: 0.74,
+  perc: 0.48,
+  crash: 0.4,
+};
+
+function defaultMix(): Record<TrackId, TrackMix> {
+  const mix = {} as Record<TrackId, TrackMix>;
+  for (const track of TRACKS) {
+    mix[track.id] = {
+      volume: DEFAULT_VOLUMES[track.id],
+      mute: false,
+      solo: false,
+      threshold: true,
+      lock: false,
+    };
+  }
+  return mix;
+}
+
+function defaultSound(drive = 0.3): Sound {
+  return {
+    drive,
+    kickDecay: 0.48,
+    kickTune: 49,
+    bassDecay: 1.15,
+    glide: 0.09,
+    hatLength: 1,
+  };
+}
+
+const starter = patternById(DEFAULT_PATTERN_ID)!;
+
+export type DrumState = {
+  bpm: number;
+  swing: number;
+  stepCount: 16 | 32;
+  page: 0 | 1;
+  grid: Grid;
+  patternId: string;
+  patternName: string;
+  genre: string;
+  group: string;
+  basePatternId: string;
+  feel: string;
+  edited: boolean;
+  tracks: Record<TrackId, TrackMix>;
+  threshold: number;
+  thresholdMaster: boolean;
+  sound: Sound;
+  master: number;
+  octave: number;
+  pitchClass: number;
+  armedNote: number;
+  slideArm: boolean;
+  paint: PaintMode;
+  active: TrackId;
+  playing: boolean;
+  recording: boolean;
+  step: number;
+  cursor: number;
+  exportBars: 4 | 8 | 16;
+  saved: SavedBeat[];
+  history: Grid[];
+  setBpm: (bpm: number) => void;
+  setSwing: (swing: number) => void;
+  setMaster: (master: number) => void;
+  setThreshold: (threshold: number) => void;
+  setThresholdMaster: (on: boolean) => void;
+  setSound: (patch: Partial<Sound>) => void;
+  setPaint: (paint: PaintMode) => void;
+  setActive: (track: TrackId) => void;
+  setPage: (page: 0 | 1) => void;
+  setStepCount: (count: 16 | 32) => void;
+  setExportBars: (bars: 4 | 8 | 16) => void;
+  setKey: (pitchClass: number, octave?: number) => void;
+  setArmed: (note: number) => void;
+  toggleSlideArm: () => void;
+  togglePlayFlag: (playing: boolean) => void;
+  toggleRecording: () => void;
+  setStep: (step: number) => void;
+  advanceCursor: () => void;
+  paintStep: (track: TrackId, index: number) => void;
+  stampStep: (track: TrackId, index: number) => void;
+  cycleExtra: (track: TrackId, index: number) => void;
+  toggleMute: (track: TrackId) => void;
+  toggleSolo: (track: TrackId) => void;
+  toggleTrackThreshold: (track: TrackId) => void;
+  toggleLock: (track: TrackId) => void;
+  setVolume: (track: TrackId, volume: number) => void;
+  clearTrack: (track: TrackId) => void;
+  loadPattern: (id: string) => void;
+  auto: () => void;
+  reset: () => void;
+  blank: () => void;
+  undo: () => void;
+  saveBeat: (name: string) => void;
+  deleteBeat: (id: string) => void;
+  loadBeat: (id: string) => void;
+  hydrate: (raw: string | null) => void;
+};
+
+function pushHistory(history: Grid[], grid: Grid): Grid[] {
+  const next = history.concat(structuredClone(grid));
+  return next.length > 30 ? next.slice(next.length - 30) : next;
+}
+
+function stampCell(state: DrumState, track: TrackId): StepCell {
+  if (state.paint === "erase") return emptyCell();
+  const vel = state.paint === "ghost" ? VEL_GHOST : state.paint === "accent" ? VEL_ACCENT : VEL_HIT;
+  return {
+    vel,
+    roll: 1,
+    note: track === "bass" ? state.armedNote : 0,
+    slide: track === "bass" ? state.slideArm : false,
+  };
+}
+
+function sameCell(a: StepCell, b: StepCell, track: TrackId): boolean {
+  if (a.vel !== b.vel) return false;
+  if (track !== "bass") return true;
+  return a.note === b.note && a.slide === b.slide;
+}
+
+function withLane(grid: Grid, track: TrackId, index: number, cell: StepCell): Grid {
+  const lane = grid[track].slice();
+  lane[index] = cell;
+  return { ...grid, [track]: lane };
+}
+
+export function toSchedule(state: DrumState): Schedule {
+  const trackThreshold = {} as Record<TrackId, boolean>;
+  const trackMute = {} as Record<TrackId, boolean>;
+  const trackSolo = {} as Record<TrackId, boolean>;
+  const volumes = {} as Record<TrackId, number>;
+  for (const track of TRACKS) {
+    trackThreshold[track.id] = state.tracks[track.id].threshold;
+    trackMute[track.id] = state.tracks[track.id].mute;
+    trackSolo[track.id] = state.tracks[track.id].solo;
+    volumes[track.id] = state.tracks[track.id].volume;
+  }
+  return {
+    grid: state.grid,
+    stepCount: state.stepCount,
+    bpm: state.bpm,
+    swing: state.swing,
+    threshold: state.threshold,
+    thresholdMaster: state.thresholdMaster,
+    trackThreshold,
+    trackMute,
+    trackSolo,
+    volumes,
+    bassRoot: bassRootOf(state.octave, state.pitchClass),
+    sound: state.sound,
+    master: state.master,
+  };
+}
+
+function persistable(state: DrumState) {
+  return {
+    v: 1,
+    bpm: state.bpm,
+    swing: state.swing,
+    stepCount: state.stepCount,
+    grid: state.grid,
+    patternId: state.patternId,
+    patternName: state.patternName,
+    genre: state.genre,
+    group: state.group,
+    basePatternId: state.basePatternId,
+    feel: state.feel,
+    edited: state.edited,
+    tracks: state.tracks,
+    threshold: state.threshold,
+    thresholdMaster: state.thresholdMaster,
+    sound: state.sound,
+    master: state.master,
+    octave: state.octave,
+    pitchClass: state.pitchClass,
+    armedNote: state.armedNote,
+    slideArm: state.slideArm,
+    paint: state.paint,
+    active: state.active,
+    exportBars: state.exportBars,
+    saved: state.saved,
+  };
+}
+
+function emptyGrid(): Grid {
+  const grid = {} as Grid;
+  for (const track of TRACKS) grid[track.id] = Array.from({ length: 32 }, () => emptyCell());
+  return grid;
+}
+
+export const useDrum = create<DrumState>((set, get) => ({
+  bpm: starter.bpm,
+  swing: starter.swing,
+  stepCount: starter.stepCount,
+  page: 0,
+  grid: gridFromPattern(starter),
+  patternId: starter.id,
+  patternName: starter.name,
+  genre: starter.genre,
+  group: starter.group,
+  basePatternId: starter.id,
+  feel: starter.feel,
+  edited: false,
+  tracks: defaultMix(),
+  threshold: 70,
+  thresholdMaster: false,
+  sound: defaultSound(starter.drive),
+  master: 0.86,
+  octave: 1,
+  pitchClass: 5,
+  armedNote: 0,
+  slideArm: false,
+  paint: "hit",
+  active: "kick",
+  playing: false,
+  recording: false,
+  step: -1,
+  cursor: 0,
+  exportBars: 8,
+  saved: [],
+  history: [],
+  setBpm: (bpm) => set({ bpm: Math.max(60, Math.min(190, Math.round(bpm))) }),
+  setSwing: (swing) => set({ swing: Math.max(0, Math.min(0.65, swing)) }),
+  setMaster: (master) => set({ master: Math.max(0, Math.min(1, master)) }),
+  setThreshold: (threshold) => set({ threshold: Math.max(1, Math.min(127, Math.round(threshold))) }),
+  setThresholdMaster: (thresholdMaster) => set({ thresholdMaster }),
+  setSound: (patch) => set((state) => ({ sound: { ...state.sound, ...patch } })),
+  setPaint: (paint) => set({ paint }),
+  setActive: (active) => set({ active }),
+  setPage: (page) => set({ page }),
+  setStepCount: (stepCount) =>
+    set((state) => {
+      if (stepCount === state.stepCount) return state;
+      if (stepCount === 16) return { stepCount, page: 0 };
+      const grid = structuredClone(state.grid);
+      for (const track of TRACKS) {
+        const empty = grid[track.id].slice(16, 32).every((cell) => cell.vel === 0);
+        if (empty) {
+          for (let index = 0; index < 16; index += 1) {
+            grid[track.id][16 + index] = { ...grid[track.id][index]! };
+          }
+        }
+      }
+      return { stepCount, grid, edited: true, history: pushHistory(state.history, state.grid) };
+    }),
+  setExportBars: (exportBars) => set({ exportBars }),
+  setKey: (pitchClass, octave) =>
+    set((state) => ({
+      pitchClass,
+      octave: octave ?? state.octave,
+    })),
+  setArmed: (armedNote) => set({ armedNote }),
+  toggleSlideArm: () => set((state) => ({ slideArm: !state.slideArm })),
+  togglePlayFlag: (playing) => set({ playing, step: playing ? 0 : -1 }),
+  toggleRecording: () =>
+    set((state) => ({ recording: !state.recording, cursor: state.recording ? state.cursor : 0 })),
+  setStep: (step) => set({ step }),
+  advanceCursor: () => set((state) => ({ cursor: (state.cursor + 1) % state.stepCount })),
+  paintStep: (track, index) =>
+    set((state) => {
+      const current = state.grid[track][index] ?? emptyCell();
+      const stamped = stampCell(state, track);
+      const next = state.paint !== "erase" && sameCell(current, stamped, track) ? emptyCell() : stamped;
+      return {
+        grid: withLane(state.grid, track, index, next),
+        edited: true,
+        history: pushHistory(state.history, state.grid),
+        active: track,
+      };
+    }),
+  stampStep: (track, index) =>
+    set((state) => ({
+      grid: withLane(state.grid, track, index, stampCell(state, track)),
+      edited: true,
+      history: pushHistory(state.history, state.grid),
+      active: track,
+    })),
+  cycleExtra: (track, index) =>
+    set((state) => {
+      const current = { ...(state.grid[track][index] ?? emptyCell()) };
+      if (track === "hat" || track === "open") {
+        current.roll = current.roll === 1 ? 2 : current.roll === 2 ? 3 : 1;
+        if (current.vel === 0) current.vel = VEL_HIT;
+      } else if (track === "bass") {
+        if (current.vel === 0) return state;
+        current.slide = !current.slide;
+      } else {
+        return state;
+      }
+      return {
+        grid: withLane(state.grid, track, index, current),
+        edited: true,
+        history: pushHistory(state.history, state.grid),
+      };
+    }),
+  toggleMute: (track) =>
+    set((state) => ({
+      tracks: {
+        ...state.tracks,
+        [track]: { ...state.tracks[track], mute: !state.tracks[track].mute },
+      },
+    })),
+  toggleSolo: (track) =>
+    set((state) => ({
+      tracks: {
+        ...state.tracks,
+        [track]: { ...state.tracks[track], solo: !state.tracks[track].solo },
+      },
+    })),
+  toggleTrackThreshold: (track) =>
+    set((state) => ({
+      tracks: {
+        ...state.tracks,
+        [track]: { ...state.tracks[track], threshold: !state.tracks[track].threshold },
+      },
+    })),
+  toggleLock: (track) =>
+    set((state) => ({
+      tracks: {
+        ...state.tracks,
+        [track]: { ...state.tracks[track], lock: !state.tracks[track].lock },
+      },
+    })),
+  setVolume: (track, volume) =>
+    set((state) => ({
+      tracks: {
+        ...state.tracks,
+        [track]: { ...state.tracks[track], volume: Math.max(0, Math.min(1, volume)) },
+      },
+    })),
+  clearTrack: (track) =>
+    set((state) => ({
+      grid: { ...state.grid, [track]: Array.from({ length: 32 }, () => emptyCell()) },
+      edited: true,
+      history: pushHistory(state.history, state.grid),
+    })),
+  loadPattern: (id) => {
+    const pattern = patternById(id);
+    if (!pattern) return;
+    set((state) => ({
+      history: pushHistory(state.history, state.grid),
+      grid: gridFromPattern(pattern),
+      bpm: pattern.bpm,
+      swing: pattern.swing,
+      stepCount: pattern.stepCount,
+      page: 0,
+      patternId: pattern.id,
+      patternName: pattern.name,
+      genre: pattern.genre,
+      group: pattern.group,
+      basePatternId: pattern.id,
+      feel: pattern.feel,
+      edited: false,
+      sound: { ...state.sound, drive: pattern.drive },
+      cursor: 0,
+    }));
+  },
+  auto: () =>
+    set((state) => {
+      const locks = {} as Record<TrackId, boolean>;
+      for (const track of TRACKS) locks[track.id] = state.tracks[track.id].lock;
+      return {
+        history: pushHistory(state.history, state.grid),
+        grid: varyGrid(state.grid, state.stepCount, locks),
+        patternId: "auto",
+        patternName: `Auto ${state.group}`,
+        edited: true,
+      };
+    }),
+  reset: () => {
+    const id = get().basePatternId;
+    get().loadPattern(patternById(id) ? id : DEFAULT_PATTERN_ID);
+  },
+  blank: () =>
+    set((state) => ({
+      history: pushHistory(state.history, state.grid),
+      grid: emptyGrid(),
+      stepCount: 16,
+      page: 0,
+      patternId: "blank",
+      patternName: "Blank",
+      genre: "Custom",
+      feel: "Empty grid. Paint steps, or record the pads in.",
+      edited: false,
+      cursor: 0,
+    })),
+  undo: () =>
+    set((state) => {
+      const history = state.history.slice();
+      const grid = history.pop();
+      if (!grid) return state;
+      return { history, grid, edited: true };
+    }),
+  saveBeat: (name) =>
+    set((state) => {
+      const beat: SavedBeat = {
+        id: `beat-${Date.now()}`,
+        name: name.trim() || "Untitled",
+        savedAt: Date.now(),
+        bpm: state.bpm,
+        swing: state.swing,
+        stepCount: state.stepCount,
+        grid: structuredClone(state.grid),
+        octave: state.octave,
+        pitchClass: state.pitchClass,
+        drive: state.sound.drive,
+        threshold: state.threshold,
+        thresholdMaster: state.thresholdMaster,
+        tracks: structuredClone(state.tracks),
+        sound: { ...state.sound },
+      };
+      return { saved: [beat, ...state.saved].slice(0, 24) };
+    }),
+  deleteBeat: (id) => set((state) => ({ saved: state.saved.filter((beat) => beat.id !== id) })),
+  loadBeat: (id) =>
+    set((state) => {
+      const beat = state.saved.find((item) => item.id === id);
+      if (!beat) return state;
+      return {
+        history: pushHistory(state.history, state.grid),
+        grid: structuredClone(beat.grid),
+        bpm: beat.bpm,
+        swing: beat.swing,
+        stepCount: beat.stepCount,
+        page: 0,
+        tracks: structuredClone(beat.tracks),
+        threshold: beat.threshold,
+        thresholdMaster: beat.thresholdMaster,
+        sound: { ...beat.sound },
+        octave: beat.octave,
+        pitchClass: beat.pitchClass,
+        patternId: beat.id,
+        patternName: beat.name,
+        genre: "My Beats",
+        feel: "Saved in this browser.",
+        edited: false,
+        basePatternId: state.basePatternId,
+      };
+    }),
+  hydrate: (raw) => {
+    if (!raw) return;
+    try {
+      const data = JSON.parse(raw) as Partial<ReturnType<typeof persistable>> & { v?: number };
+      if (data.v !== 1 || !data.grid) return;
+      for (const track of TRACKS) {
+        const lane = data.grid[track.id];
+        if (!Array.isArray(lane) || lane.length !== 32) return;
+      }
+      set({
+        bpm: data.bpm ?? starter.bpm,
+        swing: data.swing ?? 0,
+        stepCount: data.stepCount === 32 ? 32 : 16,
+        grid: data.grid,
+        patternId: data.patternId ?? starter.id,
+        patternName: data.patternName ?? starter.name,
+        genre: data.genre ?? starter.genre,
+        group: data.group ?? starter.group,
+        basePatternId: data.basePatternId ?? starter.id,
+        feel: data.feel ?? starter.feel,
+        edited: Boolean(data.edited),
+        tracks: data.tracks ?? defaultMix(),
+        threshold: data.threshold ?? 70,
+        thresholdMaster: Boolean(data.thresholdMaster),
+        sound: data.sound ?? defaultSound(),
+        master: data.master ?? 0.86,
+        octave: data.octave ?? 1,
+        pitchClass: data.pitchClass ?? 5,
+        armedNote: data.armedNote ?? 0,
+        slideArm: Boolean(data.slideArm),
+        paint: data.paint ?? "hit",
+        active: data.active ?? "kick",
+        exportBars: data.exportBars ?? 8,
+        saved: data.saved ?? [],
+      });
+    } catch {
+      /* ignore broken local saves */
+    }
+  },
+}));
+
+export function loadStoredBeat() {
+  if (typeof localStorage === "undefined") return;
+  useDrum.getState().hydrate(localStorage.getItem(STORAGE_KEY));
+}
+
+export function bindPersistence() {
+  let timer = 0;
+  return useDrum.subscribe((state) => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(() => {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(persistable(state)));
+    }, 180);
+  });
+}
