@@ -1,0 +1,866 @@
+import { useEffect, useRef, useState } from "react";
+import {
+  Circle,
+  Dices,
+  Download,
+  Lock,
+  LockOpen,
+  Play,
+  RotateCcw,
+  Save,
+  Square,
+  Trash2,
+  Undo2,
+} from "lucide-react";
+import { engine } from "@/lib/drums/engine";
+import { audioBufferToMp3, downloadBlob, renderLoop } from "@/lib/drums/mp3";
+import { GROUPS, PATTERNS } from "@/lib/drums/patterns";
+import { bindPersistence, loadStoredBeat, toSchedule, useDrum } from "@/lib/drums/store";
+import {
+  NOTE_NAMES,
+  TRACKS,
+  VEL_ACCENT,
+  VEL_GHOST,
+  VEL_HIT,
+  bassRootOf,
+  noteName,
+  type StepCell,
+  type TrackId,
+} from "@/lib/drums/types";
+
+const PAINTS = [
+  { id: "hit", label: "Hit" },
+  { id: "accent", label: "Accent" },
+  { id: "ghost", label: "Ghost" },
+  { id: "erase", label: "Erase" },
+] as const;
+
+function slug(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function Meter() {
+  const ref = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas) return;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    let frame = 0;
+    const buffer = new Uint8Array(64);
+    const draw = () => {
+      const styles = getComputedStyle(canvas);
+      const primary = styles.getPropertyValue("--color-primary").trim() || "#d6ff3f";
+      const muted = styles.getPropertyValue("--color-border").trim() || "#2e3328";
+      const { width, height } = canvas;
+      context.clearRect(0, 0, width, height);
+      const analyser = engine.analyser;
+      if (analyser) analyser.getByteFrequencyData(buffer);
+      const bars = 28;
+      const gap = 3;
+      const barWidth = (width - gap * (bars - 1)) / bars;
+      for (let index = 0; index < bars; index += 1) {
+        const raw = analyser ? (buffer[index + 2] ?? 0) / 255 : 0;
+        const level = Math.max(0.04, raw);
+        const barHeight = level * height;
+        context.fillStyle = raw > 0.72 ? primary : muted;
+        context.fillRect(index * (barWidth + gap), height - barHeight, barWidth, barHeight);
+      }
+      frame = window.requestAnimationFrame(draw);
+    };
+    frame = window.requestAnimationFrame(draw);
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+  return <canvas ref={ref} width={420} height={36} className="h-9 w-full" aria-hidden="true" />;
+}
+
+function StepButton({
+  cell,
+  index,
+  track,
+  root,
+  hot,
+  gated,
+  cursor,
+  onTap,
+  onHold,
+}: {
+  cell: StepCell;
+  index: number;
+  track: TrackId;
+  root: number;
+  hot: boolean;
+  gated: boolean;
+  cursor: boolean;
+  onTap: () => void;
+  onHold: () => void;
+}) {
+  const suppress = useRef(false);
+  const timer = useRef(0);
+  const beat = index % 4 === 0;
+  let tone = "border-border bg-surface-2 text-muted";
+  if (cell.vel >= 120) tone = "border-fg bg-fg text-bg";
+  else if (cell.vel >= 80) tone = "border-primary bg-primary text-bg";
+  else if (cell.vel > 0) tone = "border-primary bg-surface-3 text-primary";
+  const ring = hot ? "ring-2 ring-record" : cursor ? "ring-2 ring-primary" : "";
+  const label =
+    track === "bass" && cell.vel > 0
+      ? noteName(root + cell.note)
+      : cell.roll > 1
+        ? `x${cell.roll}`
+        : "";
+  return (
+    <button
+      type="button"
+      aria-label={`${track} step ${index + 1}${cell.vel ? `, velocity ${cell.vel}` : ", off"}${cell.slide ? ", slide" : ""}`}
+      aria-pressed={cell.vel > 0}
+      className={`relative h-11 w-11 shrink-0 rounded-sm border text-xs font-medium ${tone} ${ring} ${beat ? "" : ""} ${gated ? "opacity-40" : ""} ${index % 4 === 3 ? "mr-2" : ""}`}
+      onPointerDown={() => {
+        suppress.current = false;
+        timer.current = window.setTimeout(() => {
+          suppress.current = true;
+          onHold();
+        }, 380);
+      }}
+      onPointerUp={() => window.clearTimeout(timer.current)}
+      onPointerLeave={() => window.clearTimeout(timer.current)}
+      onPointerCancel={() => window.clearTimeout(timer.current)}
+      onContextMenu={(event) => event.preventDefault()}
+      onClick={() => {
+        if (suppress.current) {
+          suppress.current = false;
+          return;
+        }
+        onTap();
+      }}
+    >
+      {label}
+      {cell.slide ? <span className="absolute right-0.5 bottom-0.5 text-xs leading-none">gl</span> : null}
+    </button>
+  );
+}
+
+export function Studio() {
+  const drum = useDrum();
+  const [exporting, setExporting] = useState(false);
+  const [exportNote, setExportNote] = useState("");
+  const [query, setQuery] = useState("");
+  const [group, setGroup] = useState<string>("All");
+  const [beatName, setBeatName] = useState("");
+  const [flashes, setFlashes] = useState<Record<string, number>>({});
+  const root = bassRootOf(drum.octave, drum.pitchClass);
+  const active = TRACKS.find((track) => track.id === drum.active) ?? TRACKS[0];
+  const mix = drum.tracks[drum.active];
+  const offset = drum.page * 16;
+  const visible = drum.stepCount === 32 ? 16 : 16;
+
+  useEffect(() => {
+    loadStoredBeat();
+    const unbind = bindPersistence();
+    return () => {
+      unbind();
+      engine.stop();
+    };
+  }, []);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT")) {
+        return;
+      }
+      if (event.code === "Space") {
+        event.preventDefault();
+        void togglePlay();
+        return;
+      }
+      const pad = TRACKS.find((track) => track.key === event.key);
+      if (pad) {
+        event.preventDefault();
+        void hitPad(pad.id);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
+  async function togglePlay() {
+    const state = useDrum.getState();
+    if (state.playing) {
+      engine.stop();
+      state.togglePlayFlag(false);
+      return;
+    }
+    state.togglePlayFlag(true);
+    try {
+      await engine.start(
+        () => toSchedule(useDrum.getState()),
+        (step) => useDrum.getState().setStep(step),
+      );
+    } catch {
+      useDrum.getState().togglePlayFlag(false);
+    }
+  }
+
+  function stop() {
+    engine.stop();
+    useDrum.getState().togglePlayFlag(false);
+  }
+
+  async function hitPad(track: TrackId) {
+    const state = useDrum.getState();
+    const vel = state.paint === "ghost" ? VEL_GHOST : state.paint === "accent" ? VEL_ACCENT : VEL_HIT;
+    const midi = bassRootOf(state.octave, state.pitchClass) + state.armedNote;
+    let slideFrom: number | null = null;
+    if (track === "bass" && state.slideArm) {
+      slideFrom = midi - 5;
+    }
+    setFlashes((current) => ({ ...current, [track]: (current[track] ?? 0) + 1 }));
+    void engine.preview(track, vel, track === "bass" ? midi : null, slideFrom);
+    state.setActive(track);
+    if (!state.recording || state.paint === "erase") return;
+    const index = state.playing ? engine.quantize(state.stepCount) : state.cursor;
+    useDrum.getState().stampStep(track, index);
+    if (!state.playing) useDrum.getState().advanceCursor();
+  }
+
+  async function bounce() {
+    const state = useDrum.getState();
+    setExporting(true);
+    setExportNote("Rendering the loop…");
+    try {
+      const audio = await renderLoop(toSchedule(state), state.exportBars);
+      const blob = await audioBufferToMp3(audio);
+      const filename = `DRUMMER-${slug(state.patternName) || "beat"}-${state.bpm}.mp3`;
+      downloadBlob(blob, filename);
+      setExportNote(`Saved ${filename}`);
+    } catch (error) {
+      setExportNote(error instanceof Error ? error.message : "Export failed");
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  const filtered = PATTERNS.filter((pattern) => {
+    const hay = `${pattern.name} ${pattern.genre} ${pattern.group}`.toLowerCase();
+    const matchesGroup = group === "All" || pattern.group === group;
+    return matchesGroup && hay.includes(query.trim().toLowerCase());
+  });
+
+  const bar = drum.step < 0 ? 1 : Math.floor(drum.step / 16) + 1;
+  const beat = drum.step < 0 ? 1 : Math.floor((drum.step % 16) / 4) + 1;
+  const sub = drum.step < 0 ? 1 : (drum.step % 4) + 1;
+
+  return (
+    <main className="min-h-screen bg-bg text-fg select-none">
+      <header className="sticky top-0 z-30 border-b border-border bg-bg/95 backdrop-blur">
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-3 px-3 py-3">
+          <div className="min-w-36 flex-1">
+            <h1 className="font-display text-4xl leading-none tracking-wider">DRUMMER</h1>
+            <p className="text-xs tracking-widest text-primary">808 TRAP MACHINE</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <label className="flex items-center gap-1 text-sm text-muted" htmlFor="bpm">
+              BPM
+              <input
+                id="bpm"
+                className="w-16 rounded-sm border border-border bg-surface px-2 py-2 text-center font-display text-2xl leading-none text-fg select-text"
+                type="number"
+                min={60}
+                max={190}
+                value={drum.bpm}
+                onChange={(event) => drum.setBpm(Number(event.target.value))}
+              />
+            </label>
+            <p className="hidden font-display text-lg text-muted sm:block" aria-live="polite">
+              {bar}.{beat}.{sub}
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              className={`flex h-12 w-12 items-center justify-center rounded-md ${drum.playing ? "bg-primary text-bg" : "bg-primary text-bg"}`}
+              aria-label={drum.playing ? "Playing" : "Play"}
+              aria-pressed={drum.playing}
+              onClick={() => void togglePlay()}
+            >
+              <Play className="size-5" fill="currentColor" />
+            </button>
+            <button
+              type="button"
+              className="flex h-12 w-12 items-center justify-center rounded-md border border-border bg-surface text-fg"
+              aria-label="Stop"
+              onClick={stop}
+            >
+              <Square className="size-4" fill="currentColor" />
+            </button>
+            <button
+              type="button"
+              className={`flex h-12 items-center gap-2 rounded-md border px-3 ${drum.recording ? "border-record bg-record text-fg" : "border-border bg-surface text-fg"}`}
+              aria-pressed={drum.recording}
+              onClick={() => drum.toggleRecording()}
+            >
+              <Circle className={`size-3 ${drum.recording ? "rec-blink" : ""}`} fill="currentColor" />
+              Rec
+            </button>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex overflow-hidden rounded-md border border-border">
+              {[4, 8, 16].map((bars) => (
+                <button
+                  key={bars}
+                  type="button"
+                  className={`h-11 px-3 text-sm ${drum.exportBars === bars ? "bg-primary text-bg" : "bg-surface text-muted"}`}
+                  onClick={() => drum.setExportBars(bars as 4 | 8 | 16)}
+                >
+                  {bars}
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              className="flex h-11 items-center gap-2 rounded-md bg-fg px-3 text-sm font-medium text-bg disabled:opacity-50"
+              onClick={() => void bounce()}
+              disabled={exporting}
+            >
+              <Download className="size-4" />
+              {exporting ? "Rendering" : "Record MP3"}
+            </button>
+          </div>
+        </div>
+        <div className="mx-auto max-w-6xl px-3 pb-3">
+          <Meter />
+          <p className="mt-1 truncate text-sm text-muted">
+            {drum.genre} · {drum.patternName}
+            {drum.edited ? " · edited" : ""} · key {noteName(root)}
+            {drum.recording ? (drum.playing ? " · printing pads onto the grid" : ` · step rec ${drum.cursor + 1}`) : ""}
+          </p>
+          <p className="text-sm text-fg" aria-live="polite">
+            {exportNote}
+          </p>
+        </div>
+      </header>
+
+      <div className="mx-auto grid max-w-6xl gap-4 px-3 py-4 lg:grid-cols-[minmax(0,1.45fr)_minmax(18rem,0.8fr)]">
+        <div className="flex min-w-0 flex-col gap-4">
+          <section className="rounded-lg border border-border bg-surface p-3" aria-label="Drum pads">
+            <div className="mb-3 flex items-end justify-between gap-2">
+              <h2 className="font-display text-lg tracking-wide">PADS</h2>
+              <p className="text-xs text-muted">Keys 1–0 · space plays</p>
+            </div>
+            <div className="grid grid-cols-5 gap-2">
+              {TRACKS.map((track) => {
+                const flash = flashes[track.id] ?? 0;
+                const selected = drum.active === track.id;
+                return (
+                  <button
+                    key={track.id}
+                    type="button"
+                    className={`flex h-16 flex-col items-start justify-between rounded-md border px-2 py-2 sm:h-20 ${flash % 2 === 1 ? "pad-flash-a" : "pad-flash-b"} ${selected ? "border-primary bg-surface-3" : "border-border bg-surface-2"}`}
+                    onClick={() => void hitPad(track.id)}
+                  >
+                    <span className="text-xs text-muted">{track.key}</span>
+                    <span className="font-display text-lg leading-none tracking-wide sm:text-xl">{track.short}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+
+          <section className="rounded-lg border border-border bg-surface p-3" aria-label="Sequencer">
+            <div className="mb-3 flex flex-wrap items-end justify-between gap-2">
+              <div>
+                <h2 className="font-display text-lg tracking-wide">SEQUENCER</h2>
+                <p className="text-sm text-muted">{drum.feel}</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  className="flex h-11 items-center gap-2 rounded-md border border-border bg-surface-2 px-3 text-sm"
+                  onClick={() => drum.undo()}
+                >
+                  <Undo2 className="size-4" />
+                  Undo
+                </button>
+                <button
+                  type="button"
+                  className="flex h-11 items-center gap-2 rounded-md border border-border bg-surface-2 px-3 text-sm"
+                  onClick={() => drum.auto()}
+                >
+                  <Dices className="size-4" />
+                  Auto
+                </button>
+                <button
+                  type="button"
+                  className="flex h-11 items-center gap-2 rounded-md border border-border bg-surface-2 px-3 text-sm"
+                  onClick={() => drum.reset()}
+                >
+                  <RotateCcw className="size-4" />
+                  Reset
+                </button>
+              </div>
+            </div>
+
+            <div className="mb-3 flex flex-wrap gap-2">
+              {PAINTS.map((mode) => (
+                <button
+                  key={mode.id}
+                  type="button"
+                  aria-pressed={drum.paint === mode.id}
+                  className={`h-11 flex-1 rounded-md border px-2 text-sm font-medium ${drum.paint === mode.id ? "border-primary bg-primary text-bg" : "border-border bg-surface-2 text-fg"}`}
+                  onClick={() => drum.setPaint(mode.id)}
+                >
+                  {mode.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="mb-3 rounded-md border border-border bg-bg p-3">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <h3 className="font-display tracking-wide">THRESHOLD</h3>
+                <button
+                  type="button"
+                  aria-pressed={drum.thresholdMaster}
+                  className={`h-11 rounded-md px-3 text-sm font-medium ${drum.thresholdMaster ? "bg-primary text-bg" : "border border-border bg-surface-2 text-fg"}`}
+                  onClick={() => drum.setThresholdMaster(!drum.thresholdMaster)}
+                >
+                  {drum.thresholdMaster ? "Gate on" : "Gate off"}
+                </button>
+              </div>
+              <div className="mb-2 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  className={`h-11 rounded-md px-3 text-sm ${!drum.thresholdMaster ? "bg-fg text-bg" : "bg-surface-2 text-fg"}`}
+                  onClick={() => drum.setThresholdMaster(false)}
+                >
+                  All notes
+                </button>
+                <button
+                  type="button"
+                  className={`h-11 rounded-md px-3 text-sm ${drum.thresholdMaster && drum.threshold === 70 ? "bg-primary text-bg" : "bg-surface-2 text-fg"}`}
+                  onClick={() => {
+                    drum.setThresholdMaster(true);
+                    drum.setThreshold(70);
+                  }}
+                >
+                  Drop ghosts
+                </button>
+                <button
+                  type="button"
+                  className={`h-11 rounded-md px-3 text-sm ${drum.thresholdMaster && drum.threshold === 112 ? "bg-fg text-bg" : "bg-surface-2 text-fg"}`}
+                  onClick={() => {
+                    drum.setThresholdMaster(true);
+                    drum.setThreshold(112);
+                  }}
+                >
+                  Accents only
+                </button>
+              </div>
+              <label className="flex flex-col gap-1 text-sm" htmlFor="threshold">
+                <span className="flex justify-between text-muted">
+                  <span>Level {drum.threshold}</span>
+                  <span>Ghost 42 · Hit 100 · Accent 124</span>
+                </span>
+                <input
+                  id="threshold"
+                  type="range"
+                  min={1}
+                  max={127}
+                  value={drum.threshold}
+                  onChange={(event) => drum.setThreshold(Number(event.target.value))}
+                />
+              </label>
+              <p className="mt-1 text-xs text-muted">
+                Per-lane THR toggles choose who the gate mutes. Notes stay in the pattern.
+              </p>
+            </div>
+
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                className={`h-11 rounded-md px-3 text-sm ${drum.stepCount === 16 ? "bg-primary text-bg" : "border border-border bg-surface-2"}`}
+                onClick={() => drum.setStepCount(16)}
+              >
+                1 bar
+              </button>
+              <button
+                type="button"
+                className={`h-11 rounded-md px-3 text-sm ${drum.stepCount === 32 ? "bg-primary text-bg" : "border border-border bg-surface-2"}`}
+                onClick={() => drum.setStepCount(32)}
+              >
+                2 bars
+              </button>
+              {drum.stepCount === 32 ? (
+                <>
+                  <button
+                    type="button"
+                    className={`h-11 rounded-md px-3 text-sm ${drum.page === 0 ? "bg-fg text-bg" : "border border-border"}`}
+                    onClick={() => drum.setPage(0)}
+                  >
+                    Bar 1
+                  </button>
+                  <button
+                    type="button"
+                    className={`h-11 rounded-md px-3 text-sm ${drum.page === 1 ? "bg-fg text-bg" : "border border-border"}`}
+                    onClick={() => drum.setPage(1)}
+                  >
+                    Bar 2
+                  </button>
+                </>
+              ) : null}
+            </div>
+
+            <div className="mb-3 rounded-md border border-border bg-bg p-3">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <h3 className="font-display text-xl tracking-wide">{active.name}</h3>
+                <button
+                  type="button"
+                  className="h-11 rounded-md border border-border px-3 text-sm"
+                  onClick={() => drum.clearTrack(drum.active)}
+                >
+                  Clear lane
+                </button>
+              </div>
+              <label className="mb-2 flex items-center gap-3 text-sm text-muted" htmlFor="lane-volume">
+                Level
+                <input
+                  id="lane-volume"
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={mix.volume}
+                  onChange={(event) => drum.setVolume(drum.active, Number(event.target.value))}
+                />
+              </label>
+              <div className="grid grid-cols-4 gap-2">
+                <button
+                  type="button"
+                  aria-pressed={mix.mute}
+                  className={`h-11 rounded-md text-sm ${mix.mute ? "bg-record text-fg" : "border border-border bg-surface-2"}`}
+                  onClick={() => drum.toggleMute(drum.active)}
+                >
+                  Mute
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={mix.solo}
+                  className={`h-11 rounded-md text-sm ${mix.solo ? "bg-primary text-bg" : "border border-border bg-surface-2"}`}
+                  onClick={() => drum.toggleSolo(drum.active)}
+                >
+                  Solo
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={mix.threshold}
+                  className={`h-11 rounded-md text-sm ${mix.threshold ? "bg-primary text-bg" : "border border-border bg-surface-2"}`}
+                  onClick={() => drum.toggleTrackThreshold(drum.active)}
+                >
+                  THR
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={mix.lock}
+                  className={`flex h-11 items-center justify-center gap-1 rounded-md text-sm ${mix.lock ? "bg-fg text-bg" : "border border-border bg-surface-2"}`}
+                  onClick={() => drum.toggleLock(drum.active)}
+                >
+                  {mix.lock ? <Lock className="size-4" /> : <LockOpen className="size-4" />}
+                  Lock
+                </button>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto pb-1">
+              <div className="min-w-max">
+                <div className="mb-1 flex">
+                  <div className="sticky left-0 z-10 w-20 shrink-0 bg-surface" />
+                  {Array.from({ length: visible }, (_, index) => {
+                    const subLabel = index % 4 === 0 ? String(Math.floor(index / 4) + 1 + drum.page * 4) : ["", "e", "&", "a"][index % 4];
+                    return (
+                      <div
+                        key={index}
+                        className={`flex h-5 w-11 shrink-0 items-end justify-center text-xs ${index % 4 === 0 ? "text-primary" : "text-muted"} ${index % 4 === 3 ? "mr-2" : ""}`}
+                      >
+                        {subLabel}
+                      </div>
+                    );
+                  })}
+                </div>
+                {TRACKS.map((track) => (
+                  <div key={track.id} className="mb-1 flex items-center">
+                    <button
+                      type="button"
+                      className={`sticky left-0 z-10 h-11 w-20 shrink-0 rounded-sm border text-left text-xs font-medium ${drum.active === track.id ? "border-primary bg-primary text-bg" : "border-border bg-surface text-fg"}`}
+                      onClick={() => drum.setActive(track.id)}
+                    >
+                      <span className="block px-2">{track.short}</span>
+                    </button>
+                    {Array.from({ length: visible }, (_, index) => {
+                      const absolute = offset + index;
+                      const cell = drum.grid[track.id][absolute] ?? { vel: 0, roll: 1 as const, note: 0, slide: false };
+                      const gated =
+                        drum.thresholdMaster &&
+                        drum.tracks[track.id].threshold &&
+                        cell.vel > 0 &&
+                        cell.vel < drum.threshold;
+                      return (
+                        <StepButton
+                          key={absolute}
+                          cell={cell}
+                          index={absolute}
+                          track={track.id}
+                          root={root}
+                          hot={drum.step === absolute}
+                          cursor={drum.recording && !drum.playing && drum.cursor === absolute}
+                          gated={gated}
+                          onTap={() => drum.paintStep(track.id, absolute)}
+                          onHold={() => drum.cycleExtra(track.id, absolute)}
+                        />
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <p className="mt-2 text-xs text-muted">
+              Tap paints the selected velocity. Hold a hat step to cycle rolls (x2, x3). Hold an 808 step to toggle glide.
+            </p>
+          </section>
+
+          <section className="rounded-lg border border-border bg-surface p-3" aria-label="808 key">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <h2 className="font-display text-lg tracking-wide">808 KEY {noteName(root)}</h2>
+              <div className="flex gap-2">
+                {[0, 1, 2].map((octave) => (
+                  <button
+                    key={octave}
+                    type="button"
+                    className={`h-11 w-11 rounded-md text-sm ${drum.octave === octave ? "bg-primary text-bg" : "border border-border bg-surface-2"}`}
+                    onClick={() => drum.setKey(drum.pitchClass, octave)}
+                  >
+                    {octave}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="mb-3 flex gap-2 overflow-x-auto pb-1">
+              {NOTE_NAMES.map((name, index) => (
+                <button
+                  key={name}
+                  type="button"
+                  className={`h-11 min-w-11 shrink-0 rounded-md px-2 text-sm ${drum.pitchClass === index ? "bg-primary text-bg" : name.includes("#") ? "bg-bg text-muted" : "border border-border bg-surface-2 text-fg"}`}
+                  onClick={() => drum.setKey(index)}
+                >
+                  {name}
+                </button>
+              ))}
+            </div>
+            <p className="mb-2 text-xs text-muted">Armed note for the next 808 step. Tap a key, then paint the 808 lane.</p>
+            <div className="flex gap-2 overflow-x-auto pb-1">
+              {Array.from({ length: 13 }, (_, index) => {
+                const midi = root + index;
+                const armed = drum.armedNote === index;
+                return (
+                  <button
+                    key={midi}
+                    type="button"
+                    className={`h-11 min-w-12 shrink-0 rounded-md px-2 text-sm ${armed ? "bg-fg text-bg" : "border border-border bg-surface-2"}`}
+                    onClick={() => {
+                      drum.setArmed(index);
+                      drum.setActive("bass");
+                      void engine.preview("bass", VEL_HIT, midi, drum.slideArm ? midi - 5 : null);
+                    }}
+                  >
+                    {noteName(midi)}
+                  </button>
+                );
+              })}
+            </div>
+            <button
+              type="button"
+              aria-pressed={drum.slideArm}
+              className={`mt-3 h-11 rounded-md px-3 text-sm ${drum.slideArm ? "bg-primary text-bg" : "border border-border bg-surface-2"}`}
+              onClick={() => drum.toggleSlideArm()}
+            >
+              Slide into next 808
+            </button>
+          </section>
+        </div>
+
+        <div className="flex min-w-0 flex-col gap-4">
+          <section className="rounded-lg border border-border bg-surface p-3" aria-label="Pattern library">
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <h2 className="font-display text-lg tracking-wide">PATTERNS</h2>
+              <span className="text-sm text-muted">{PATTERNS.length}</span>
+            </div>
+            <input
+              className="mb-3 h-11 w-full rounded-md border border-border bg-bg px-3 text-sm text-fg select-text"
+              placeholder="Search trap, drill, phonk…"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              aria-label="Search patterns"
+            />
+            <div className="mb-3 flex gap-2 overflow-x-auto pb-1">
+              {["All", ...GROUPS].map((name) => (
+                <button
+                  key={name}
+                  type="button"
+                  className={`h-11 shrink-0 rounded-md px-3 text-sm ${group === name ? "bg-primary text-bg" : "border border-border bg-surface-2 text-fg"}`}
+                  onClick={() => setGroup(name)}
+                >
+                  {name}
+                </button>
+              ))}
+            </div>
+            <div className="flex max-h-96 flex-col gap-2 overflow-y-auto pr-1">
+              {filtered.map((pattern) => {
+                const selected = drum.basePatternId === pattern.id && drum.patternId === pattern.id;
+                return (
+                  <button
+                    key={pattern.id}
+                    type="button"
+                    className={`rounded-md border px-3 py-3 text-left ${selected ? "border-primary bg-surface-3" : "border-border bg-bg"}`}
+                    onClick={() => drum.loadPattern(pattern.id)}
+                  >
+                    <span className="flex items-baseline justify-between gap-2">
+                      <span className="font-medium">{pattern.name}</span>
+                      <span className="text-xs text-muted">{pattern.bpm}</span>
+                    </span>
+                    <span className="mt-1 block text-xs text-primary">{pattern.genre}</span>
+                    <span className="mt-1 block text-sm text-muted">{pattern.feel}</span>
+                  </button>
+                );
+              })}
+              {filtered.length === 0 ? <p className="text-sm text-muted">No patterns in this lane.</p> : null}
+            </div>
+            <button
+              type="button"
+              className="mt-3 h-11 w-full rounded-md border border-border text-sm"
+              onClick={() => drum.blank()}
+            >
+              Blank grid
+            </button>
+          </section>
+
+          <section className="rounded-lg border border-border bg-surface p-3" aria-label="My beats">
+            <h2 className="mb-3 font-display text-lg tracking-wide">MY BEATS</h2>
+            <form
+              className="mb-3 flex gap-2"
+              onSubmit={(event) => {
+                event.preventDefault();
+                drum.saveBeat(beatName);
+                setBeatName("");
+              }}
+            >
+              <input
+                className="h-11 min-w-0 flex-1 rounded-md border border-border bg-bg px-3 text-sm select-text"
+                placeholder="Name this beat"
+                value={beatName}
+                onChange={(event) => setBeatName(event.target.value)}
+                aria-label="Beat name"
+              />
+              <button type="submit" className="flex h-11 items-center gap-2 rounded-md bg-primary px-3 text-sm font-medium text-bg">
+                <Save className="size-4" />
+                Save
+              </button>
+            </form>
+            <div className="flex flex-col gap-2">
+              {drum.saved.length === 0 ? (
+                <p className="text-sm text-muted">Saves stay in this browser.</p>
+              ) : (
+                drum.saved.map((beat) => (
+                  <div key={beat.id} className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      className="h-11 min-w-0 flex-1 truncate rounded-md border border-border bg-bg px-3 text-left text-sm"
+                      onClick={() => drum.loadBeat(beat.id)}
+                    >
+                      {beat.name}
+                      <span className="ml-2 text-muted">{beat.bpm}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="flex h-11 w-11 items-center justify-center rounded-md border border-border"
+                      aria-label={`Delete ${beat.name}`}
+                      onClick={() => drum.deleteBeat(beat.id)}
+                    >
+                      <Trash2 className="size-4" />
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          </section>
+
+          <section className="rounded-lg border border-border bg-surface p-3" aria-label="Mix">
+            <h2 className="mb-3 font-display text-lg tracking-wide">MIX</h2>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Slider label="Swing" value={drum.swing} min={0} max={0.65} step={0.01} display={`${Math.round(drum.swing * 100)}%`} onChange={drum.setSwing} />
+              <Slider label="Drive" value={drum.sound.drive} min={0} max={1} step={0.01} display={`${Math.round(drum.sound.drive * 100)}`} onChange={(value) => drum.setSound({ drive: value })} />
+              <Slider label="Master" value={drum.master} min={0} max={1} step={0.01} display={`${Math.round(drum.master * 100)}`} onChange={drum.setMaster} />
+              <Slider label="Kick decay" value={drum.sound.kickDecay} min={0.18} max={1.3} step={0.01} display={drum.sound.kickDecay.toFixed(2)} onChange={(value) => drum.setSound({ kickDecay: value })} />
+              <Slider label="Kick tune" value={drum.sound.kickTune} min={36} max={72} step={1} display={`${Math.round(drum.sound.kickTune)} Hz`} onChange={(value) => drum.setSound({ kickTune: value })} />
+              <Slider label="808 decay" value={drum.sound.bassDecay} min={0.3} max={2} step={0.01} display={drum.sound.bassDecay.toFixed(2)} onChange={(value) => drum.setSound({ bassDecay: value })} />
+              <Slider label="Glide" value={drum.sound.glide} min={0.02} max={0.22} step={0.01} display={drum.sound.glide.toFixed(2)} onChange={(value) => drum.setSound({ glide: value })} />
+              <Slider label="Hat length" value={drum.sound.hatLength} min={0.45} max={1.8} step={0.01} display={drum.sound.hatLength.toFixed(2)} onChange={(value) => drum.setSound({ hatLength: value })} />
+            </div>
+            <div className="mt-4 flex flex-col gap-3">
+              {TRACKS.map((track) => (
+                <Slider
+                  key={track.id}
+                  label={track.name}
+                  value={drum.tracks[track.id].volume}
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  display={`${Math.round(drum.tracks[track.id].volume * 100)}`}
+                  onChange={(value) => drum.setVolume(track.id, value)}
+                />
+              ))}
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+  );
+}
+
+function Slider({
+  label,
+  value,
+  min,
+  max,
+  step,
+  display,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  display: string;
+  onChange: (value: number) => void;
+}) {
+  const id = `mix-${label.replace(/\s+/g, "-").toLowerCase()}`;
+  return (
+    <label htmlFor={id} className="flex flex-col gap-1 text-sm">
+      <span className="flex items-center justify-between gap-3 text-muted">
+        <span>{label}</span>
+        <span className="font-medium text-fg">{display}</span>
+      </span>
+      <input
+        id={id}
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(event) => onChange(Number(event.target.value))}
+      />
+    </label>
+  );
+}
